@@ -134,7 +134,13 @@ impl CodexManager {
         let approval_policy = Some("on-request");
         let sandbox_mode = match settings.permissions_mode {
             PermissionsMode::Read => "read-only",
-            PermissionsMode::Full => "workspace-write",
+            PermissionsMode::Full => {
+                if settings.allow_context_writes {
+                    "workspace-write"
+                } else {
+                    "read-only"
+                }
+            }
         };
 
         let params = json!({
@@ -192,13 +198,19 @@ impl CodexManager {
 
         let sandbox_policy = match settings.permissions_mode {
             PermissionsMode::Read => json!({ "type": "readOnly" }),
-            PermissionsMode::Full => json!({
-                "type": "workspaceWrite",
-                "writableRoots": [],
-                "networkAccess": settings.shell_network_access,
-                "excludeTmpdirEnvVar": false,
-                "excludeSlashTmp": false
-            }),
+            PermissionsMode::Full => {
+                if settings.allow_context_writes {
+                    json!({
+                        "type": "workspaceWrite",
+                        "writableRoots": [],
+                        "networkAccess": settings.shell_network_access,
+                        "excludeTmpdirEnvVar": false,
+                        "excludeSlashTmp": false
+                    })
+                } else {
+                    json!({ "type": "readOnly" })
+                }
+            }
         };
 
         let turn_params = json!({
