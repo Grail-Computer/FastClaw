@@ -1,0 +1,30 @@
+{% extends "layout.html" %}
+{% block title %}Grail | Queue{% endblock %}
+{% block content %}
+  <h2 style="margin:0 0 10px 0; font-weight:700;">Queue</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Status</th>
+        <th>Channel</th>
+        <th>Thread TS</th>
+        <th>Prompt</th>
+        <th>Created</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tasks %}
+        <tr>
+          <td>{{ t.id }}</td>
+          <td>{{ t.status }}</td>
+          <td>{{ t.channel_id }}</td>
+          <td>{{ t.thread_ts }}</td>
+          <td style="max-width: 420px; color: var(--muted);">{{ t.prompt_text }}</td>
+          <td style="color: var(--muted);">{{ t.created_at }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+

@@ -1,0 +1,2 @@
+fn(axum::extract::State<AppState>, Form<SettingsForm>) -> impl Future<Output = Result<impl IntoResponse, anyhow::Error>> {admin_settings_post}
+fn(axum::extract::State<AppState>, Form<SettingsForm>) -> impl Future<Output = Result<impl IntoResponse, anyhow::Error>> {admin_settings_post}: Handler<_, _>

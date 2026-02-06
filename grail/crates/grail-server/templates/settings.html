@@ -1,0 +1,22 @@
+{% extends "layout.html" %}
+{% block title %}Grail | Settings{% endblock %}
+{% block content %}
+  <h2 style="margin:0 0 10px 0; font-weight:700;">Settings</h2>
+  <form method="post" action="/admin/settings">
+    <label for="context_last_n">Slack context: last N messages</label>
+    <input id="context_last_n" name="context_last_n" type="number" min="1" max="200" value="{{ context_last_n }}" />
+
+    <label for="permissions_mode">Agent permissions</label>
+    <select id="permissions_mode" name="permissions_mode">
+      <option value="read" {% if permissions_mode == "read" %}selected{% endif %}>Read-only (no commands, no writes)</option>
+      <option value="full" {% if permissions_mode == "full" %}selected{% endif %}>Full (commands + context writes)</option>
+    </select>
+
+    <button type="submit">Save</button>
+  </form>
+
+  <p style="margin:16px 0 0 0; color: var(--muted);">
+    In read-only mode, Grail will still answer in Slack, but Codex side-effects are disabled.
+  </p>
+{% endblock %}
+

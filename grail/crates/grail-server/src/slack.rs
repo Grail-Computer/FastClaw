@@ -1,0 +1,230 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::Context;
+use bytes::Bytes;
+use hmac::{Hmac, Mac};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SlackSignatureError {
+    #[error("missing header: {0}")]
+    MissingHeader(&'static str),
+    #[error("invalid header: {0}")]
+    InvalidHeader(&'static str),
+    #[error("timestamp too old")]
+    TimestampTooOld,
+    #[error("signature mismatch")]
+    SignatureMismatch,
+}
+
+pub fn verify_slack_signature(
+    signing_secret: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<(), SlackSignatureError> {
+    let timestamp = headers
+        .get("X-Slack-Request-Timestamp")
+        .ok_or(SlackSignatureError::MissingHeader(
+            "X-Slack-Request-Timestamp",
+        ))?
+        .to_str()
+        .map_err(|_| SlackSignatureError::InvalidHeader("X-Slack-Request-Timestamp"))?;
+
+    let signature = headers
+        .get("X-Slack-Signature")
+        .ok_or(SlackSignatureError::MissingHeader("X-Slack-Signature"))?
+        .to_str()
+        .map_err(|_| SlackSignatureError::InvalidHeader("X-Slack-Signature"))?;
+
+    let ts: i64 = timestamp
+        .parse()
+        .map_err(|_| SlackSignatureError::InvalidHeader("X-Slack-Request-Timestamp"))?;
+
+    // Reject if timestamp is too far from "now" to reduce replay.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs() as i64;
+    if (now - ts).abs() > 60 * 5 {
+        return Err(SlackSignatureError::TimestampTooOld);
+    }
+
+    let base = format!("v0:{ts}:{}", String::from_utf8_lossy(body));
+    let mut mac =
+        HmacSha256::new_from_slice(signing_secret.as_bytes()).expect("HMAC key valid");
+    mac.update(base.as_bytes());
+    let expected = format!("v0={}", hex::encode(mac.finalize().into_bytes()));
+
+    // Constant-time compare.
+    if expected.as_bytes().ct_eq(signature.as_bytes()).unwrap_u8() != 1 {
+        return Err(SlackSignatureError::SignatureMismatch);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct SlackClient {
+    http: reqwest::Client,
+    bot_token: String,
+}
+
+impl SlackClient {
+    pub fn new(http: reqwest::Client, bot_token: String) -> Self {
+        Self { http, bot_token }
+    }
+
+    fn headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", self.bot_token))
+                .expect("slack token header value"),
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers
+    }
+
+    pub async fn post_message(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            channel: &'a str,
+            text: &'a str,
+            thread_ts: &'a str,
+        }
+
+        let resp: SlackApiResponse<serde_json::Value> = self
+            .http
+            .post("https://slack.com/api/chat.postMessage")
+            .headers(self.headers())
+            .json(&Req {
+                channel,
+                text,
+                thread_ts,
+            })
+            .send()
+            .await
+            .context("slack chat.postMessage request")?
+            .json()
+            .await
+            .context("slack chat.postMessage decode")?;
+
+        if !resp.ok {
+            anyhow::bail!(
+                "slack chat.postMessage failed: {}",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string())
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn fetch_channel_history(
+        &self,
+        channel: &str,
+        latest: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<SlackMessage>> {
+        let resp: SlackApiResponse<HistoryResponse> = self
+            .http
+            .get("https://slack.com/api/conversations.history")
+            .headers(self.headers())
+            .query(&[
+                ("channel", channel),
+                ("latest", latest),
+                ("limit", &limit.to_string()),
+                ("inclusive", "false"),
+            ])
+            .send()
+            .await
+            .context("slack conversations.history request")?
+            .json()
+            .await
+            .context("slack conversations.history decode")?;
+
+        if !resp.ok {
+            anyhow::bail!(
+                "slack conversations.history failed: {}",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string())
+            );
+        }
+        Ok(resp
+            .data
+            .map(|d| d.messages)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .collect())
+    }
+
+    pub async fn fetch_thread_replies(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        latest: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<SlackMessage>> {
+        let resp: SlackApiResponse<RepliesResponse> = self
+            .http
+            .get("https://slack.com/api/conversations.replies")
+            .headers(self.headers())
+            .query(&[
+                ("channel", channel),
+                ("ts", thread_ts),
+                ("latest", latest),
+                ("limit", &limit.to_string()),
+                ("inclusive", "true"),
+            ])
+            .send()
+            .await
+            .context("slack conversations.replies request")?
+            .json()
+            .await
+            .context("slack conversations.replies decode")?;
+
+        if !resp.ok {
+            anyhow::bail!(
+                "slack conversations.replies failed: {}",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string())
+            );
+        }
+        Ok(resp.data.map(|d| d.messages).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SlackApiResponse<T> {
+    pub ok: bool,
+    pub error: Option<String>,
+    #[serde(flatten)]
+    pub data: Option<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryResponse {
+    messages: Vec<SlackMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepliesResponse {
+    messages: Vec<SlackMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlackMessage {
+    pub ts: String,
+    pub text: Option<String>,
+    pub user: Option<String>,
+    pub bot_id: Option<String>,
+    pub subtype: Option<String>,
+}
+

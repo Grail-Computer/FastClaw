@@ -1,0 +1,40 @@
+{% extends "layout.html" %}
+{% block title %}Grail | Status{% endblock %}
+{% block content %}
+  <h2 style="margin:0 0 10px 0; font-weight:700;">Status</h2>
+  <div class="grid">
+    <div class="kv">
+      <div class="k">SLACK_SIGNING_SECRET</div>
+      <div class="v">
+        {% if slack_signing_secret_set %}
+          <span class="pill ok">set</span>
+        {% else %}
+          <span class="pill bad">missing</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="kv">
+      <div class="k">SLACK_BOT_TOKEN</div>
+      <div class="v">
+        {% if slack_bot_token_set %}
+          <span class="pill ok">set</span>
+        {% else %}
+          <span class="pill bad">missing</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="kv">
+      <div class="k">Queue Depth</div>
+      <div class="v"><span class="pill">{{ queue_depth }}</span></div>
+    </div>
+    <div class="kv">
+      <div class="k">Permissions</div>
+      <div class="v"><span class="pill">{{ permissions_mode }}</span></div>
+    </div>
+  </div>
+
+  <p style="margin:16px 0 0 0; color: var(--muted);">
+    Slack events: <span class="pill">POST /slack/events</span>
+  </p>
+{% endblock %}
+
