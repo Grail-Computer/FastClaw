@@ -1,2 +1,0 @@
-fn(axum::extract::State<AppState>) -> impl Future<Output = Result<axum::response::Html<std::string::String>, anyhow::Error>> {admin_status}
-fn(axum::extract::State<AppState>) -> impl Future<Output = Result<axum::response::Html<std::string::String>, anyhow::Error>> {admin_status}: Handler<_, _>
