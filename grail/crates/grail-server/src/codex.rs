@@ -512,10 +512,50 @@ async fn spawn_codex_app_server(
     web_allow_domains: Option<&str>,
     web_deny_domains: Option<&str>,
 ) -> anyhow::Result<CodexProc> {
+    // Codex CLI argument surface has changed across versions. Some builds accept
+    // `--listen stdio://` while others default to stdio and reject `--listen`.
+    // To be resilient, try the newer syntax first, then fall back to the minimal
+    // invocation.
+    for args in [
+        vec!["app-server", "--listen", "stdio://"],
+        vec!["app-server"],
+    ] {
+        match spawn_codex_with_args(
+            codex_bin,
+            &args,
+            codex_home,
+            openai_api_key,
+            slack_bot_token,
+            slack_allow_channels,
+            brave_search_api_key,
+            web_allow_domains,
+            web_deny_domains,
+        )
+        .await
+        {
+            Ok(proc) => return Ok(proc),
+            Err(err) => {
+                warn!(error = %err, args = ?args, "failed to start codex app-server");
+            }
+        }
+    }
+
+    anyhow::bail!("failed to start codex app-server after trying compatible arg variants")
+}
+
+async fn spawn_codex_with_args(
+    codex_bin: &str,
+    args: &[&str],
+    codex_home: &Path,
+    openai_api_key: Option<&str>,
+    slack_bot_token: Option<&str>,
+    slack_allow_channels: Option<&str>,
+    brave_search_api_key: Option<&str>,
+    web_allow_domains: Option<&str>,
+    web_deny_domains: Option<&str>,
+) -> anyhow::Result<CodexProc> {
     let mut cmd = Command::new(codex_bin);
-    cmd.arg("app-server");
-    cmd.arg("--listen");
-    cmd.arg("stdio://");
+    cmd.args(args);
     cmd.env("CODEX_HOME", codex_home);
     if let Some(key) = openai_api_key {
         cmd.env("OPENAI_API_KEY", key);
@@ -539,7 +579,9 @@ async fn spawn_codex_app_server(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().context("spawn codex app-server")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn codex app-server (args={:?})", args))?;
     let stdin = child.stdin.take().context("codex stdin missing")?;
     let stdout = child.stdout.take().context("codex stdout missing")?;
     let stderr = child.stderr.take().context("codex stderr missing")?;
@@ -569,7 +611,7 @@ async fn spawn_codex_app_server(
         .await?;
     proc.notify("initialized", None).await?;
 
-    info!("codex app-server initialized");
+    info!(args = ?args, "codex app-server initialized");
     Ok(proc)
 }
 
