@@ -22,6 +22,7 @@ Note: the `Dockerfile` downloads a pinned Codex release (`CODEX_VERSION` build a
 
 1. Create a new Railway project from this repo.
 2. Add a **Volume** mounted at `/data` (required for persistence).
+   - Keep replicas at **1**. This template uses SQLite on the mounted volume and is intended to run single-replica.
 3. Set environment variables:
    - `ADMIN_PASSWORD` (required)
    - `SLACK_SIGNING_SECRET` (required; can also be stored in SQLite if `GRAIL_MASTER_KEY` is set)
