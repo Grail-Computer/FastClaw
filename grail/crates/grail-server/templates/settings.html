@@ -58,38 +58,96 @@
 
   <h3 style="margin:18px 0 10px 0;">Credentials</h3>
 
-  {% if master_key_set %}
-    <div class="grid" style="margin-bottom: 12px;">
-      <div class="kv">
-        <div class="k">OPENAI_API_KEY</div>
-        <div class="v">
-          {% if openai_api_key_set %}
-            <span class="pill ok">set</span>
-          {% else %}
-            <span class="pill bad">missing</span>
-          {% endif %}
-        </div>
-      </div>
-      <div class="kv">
-        <div class="k">Storage</div>
-        <div class="v"><span class="pill">SQLite (encrypted)</span></div>
+  <div class="grid" style="margin-bottom: 12px;">
+    <div class="kv">
+      <div class="k">OPENAI_API_KEY</div>
+      <div class="v">
+        {% if openai_api_key_set %}
+          <span class="pill ok">set</span>
+        {% else %}
+          <span class="pill bad">missing</span>
+        {% endif %}
       </div>
     </div>
 
+    <div class="kv">
+      <div class="k">SLACK_SIGNING_SECRET</div>
+      <div class="v">
+        {% if slack_signing_secret_set %}
+          <span class="pill ok">set</span>
+        {% else %}
+          <span class="pill bad">missing</span>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="kv">
+      <div class="k">SLACK_BOT_TOKEN</div>
+      <div class="v">
+        {% if slack_bot_token_set %}
+          <span class="pill ok">set</span>
+        {% else %}
+          <span class="pill bad">missing</span>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="kv">
+      <div class="k">Storage</div>
+      <div class="v">
+        {% if master_key_set %}
+          <span class="pill">Env or SQLite (encrypted)</span>
+        {% else %}
+          <span class="pill">Env only</span>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {% if master_key_set %}
     <form method="post" action="/admin/secrets/openai">
       <label for="openai_api_key">Set OpenAI API key</label>
       <input id="openai_api_key" name="openai_api_key" type="password" placeholder="sk-..." />
-      <button type="submit">Save Key</button>
+      <button type="submit">Save OpenAI Key</button>
     </form>
 
     <form method="post" action="/admin/secrets/openai/delete">
       <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-        Clear Stored Key
+        Clear Stored OpenAI Key
       </button>
     </form>
+
+    <form method="post" action="/admin/secrets/slack/signing">
+      <label for="slack_signing_secret">Set Slack signing secret</label>
+      <input id="slack_signing_secret" name="slack_signing_secret" type="password" />
+      <button type="submit">Save Slack Signing Secret</button>
+    </form>
+
+    <form method="post" action="/admin/secrets/slack/signing/delete">
+      <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
+        Clear Stored Slack Signing Secret
+      </button>
+    </form>
+
+    <form method="post" action="/admin/secrets/slack/bot">
+      <label for="slack_bot_token">Set Slack bot token</label>
+      <input id="slack_bot_token" name="slack_bot_token" type="password" placeholder="xoxb-..." />
+      <button type="submit">Save Slack Bot Token</button>
+    </form>
+
+    <form method="post" action="/admin/secrets/slack/bot/delete">
+      <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
+        Clear Stored Slack Bot Token
+      </button>
+    </form>
+
+    <p style="margin:16px 0 0 0; color: var(--muted);">
+      Environment variables take precedence over stored secrets.
+    </p>
   {% else %}
     <p style="margin: 0; color: var(--muted);">
-      Set <span class="pill">GRAIL_MASTER_KEY</span> to enable storing secrets in SQLite. As an alternative, set <span class="pill">OPENAI_API_KEY</span> as an environment variable.
+      Set <span class="pill">GRAIL_MASTER_KEY</span> to enable storing secrets in SQLite.
+      Otherwise, set these as environment variables in Railway.
     </p>
   {% endif %}
 

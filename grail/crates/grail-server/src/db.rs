@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -10,7 +11,8 @@ pub async fn init_sqlite(db_path: &Path) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal);
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -279,6 +281,42 @@ pub async fn reset_running_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
     .execute(pool)
     .await
     .context("reset running tasks")?;
+    Ok(res.rows_affected())
+}
+
+pub async fn cleanup_old_tasks(pool: &SqlitePool, max_age_days: i64) -> anyhow::Result<u64> {
+    anyhow::ensure!(max_age_days >= 1, "max_age_days too small");
+    let seconds = max_age_days.saturating_mul(86_400);
+    let res = sqlx::query(
+        r#"
+        DELETE FROM tasks
+        WHERE status IN ('succeeded', 'failed', 'cancelled')
+          AND created_at < unixepoch() - ?1
+        "#,
+    )
+    .bind(seconds)
+    .execute(pool)
+    .await
+    .context("cleanup old tasks")?;
+    Ok(res.rows_affected())
+}
+
+pub async fn cleanup_old_processed_events(
+    pool: &SqlitePool,
+    max_age_days: i64,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!(max_age_days >= 1, "max_age_days too small");
+    let seconds = max_age_days.saturating_mul(86_400);
+    let res = sqlx::query(
+        r#"
+        DELETE FROM processed_events
+        WHERE processed_at < unixepoch() - ?1
+        "#,
+    )
+    .bind(seconds)
+    .execute(pool)
+    .await
+    .context("cleanup old processed events")?;
     Ok(res.rows_affected())
 }
 

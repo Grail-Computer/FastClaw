@@ -188,7 +188,7 @@ impl SlackClient {
                 ("ts", thread_ts),
                 ("latest", latest),
                 ("limit", &limit.to_string()),
-                ("inclusive", "true"),
+                ("inclusive", "false"),
             ])
             .send()
             .await

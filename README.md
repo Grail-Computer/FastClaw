@@ -24,10 +24,10 @@ Note: the `Dockerfile` downloads a pinned Codex release (`CODEX_VERSION` build a
 2. Add a **Volume** mounted at `/data` (required for persistence).
 3. Set environment variables:
    - `ADMIN_PASSWORD` (required)
-   - `SLACK_SIGNING_SECRET` (required)
-   - `SLACK_BOT_TOKEN` (required)
+   - `SLACK_SIGNING_SECRET` (required; can also be stored in SQLite if `GRAIL_MASTER_KEY` is set)
+   - `SLACK_BOT_TOKEN` (required; can also be stored in SQLite if `GRAIL_MASTER_KEY` is set)
    - `OPENAI_API_KEY` (recommended)
-   - `GRAIL_MASTER_KEY` (optional; required only if you want to set the OpenAI key via the dashboard and store it encrypted). Generate with: `openssl rand -hex 32`
+   - `GRAIL_MASTER_KEY` (optional; required only if you want to store secrets (OpenAI/Slack) via the dashboard, encrypted in SQLite). Generate with: `openssl rand -hex 32`
    - `BASE_URL` (optional; used only to render full URLs in the dashboard, e.g. the Slack events URL)
 4. Deploy.
 
@@ -45,8 +45,8 @@ This template is intentionally “single workspace per deployment”.
    - `https://<your-railway-domain>/slack/events`
 4. Install the app to your workspace.
 5. Copy:
-   - **Signing Secret** -> `SLACK_SIGNING_SECRET`
-   - **Bot User OAuth Token** -> `SLACK_BOT_TOKEN`
+   - **Signing Secret** -> `SLACK_SIGNING_SECRET` (or store it in `/admin/settings` if `GRAIL_MASTER_KEY` is set)
+   - **Bot User OAuth Token** -> `SLACK_BOT_TOKEN` (or store it in `/admin/settings` if `GRAIL_MASTER_KEY` is set)
 
 ## Dashboard
 
@@ -58,7 +58,7 @@ This template is intentionally “single workspace per deployment”.
 - context writes enable/disable
 - shell network access toggle (full mode only)
 
-If `GRAIL_MASTER_KEY` is set, you can also store `OPENAI_API_KEY` encrypted in SQLite from the dashboard.
+If `GRAIL_MASTER_KEY` is set, you can also store `OPENAI_API_KEY`, `SLACK_SIGNING_SECRET`, and `SLACK_BOT_TOKEN` encrypted in SQLite from the dashboard.
 
 `/admin/auth` lets you optionally log in with ChatGPT via a device code flow (writes tokens to `/data/codex/auth.json`). This is useful if you don't want to provide an API key.
 

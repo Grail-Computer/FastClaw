@@ -5,6 +5,7 @@ mod config;
 mod crypto;
 mod db;
 mod models;
+mod secrets;
 mod slack;
 mod templates;
 mod worker;
@@ -31,6 +32,9 @@ use tracing_subscriber::EnvFilter;
 use crate::config::Config;
 use crate::crypto::{Crypto, parse_master_key};
 use crate::models::PermissionsMode;
+use crate::secrets::{
+    openai_api_key_configured, slack_bot_token_configured, slack_signing_secret_configured,
+};
 use crate::slack::{verify_slack_signature, SlackClient};
 use crate::templates::{AuthTemplate, DeviceLoginRow, SettingsTemplate, StatusTemplate, TasksTemplate};
 
@@ -68,7 +72,7 @@ impl IntoResponse for AppError {
 struct AppState {
     config: Arc<Config>,
     pool: SqlitePool,
-    slack: Option<SlackClient>,
+    http: reqwest::Client,
     crypto: Option<Arc<Crypto>>,
 }
 
@@ -85,20 +89,16 @@ async fn main() -> anyhow::Result<()> {
     let db_path = config.data_dir.join("grail.sqlite");
     let pool = db::init_sqlite(&db_path).await?;
 
-	    let http = reqwest::Client::builder()
-	        .connect_timeout(Duration::from_secs(10))
-	        .timeout(Duration::from_secs(30))
-	        .build()
-	        .context("build reqwest client")?;
-    let slack = config
-        .slack_bot_token
-        .clone()
-        .map(|t| SlackClient::new(http, t));
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build reqwest client")?;
 
     let state = AppState {
         config: config.clone(),
         pool,
-        slack,
+        http,
         crypto: config
             .master_key
             .as_deref()
@@ -124,6 +124,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/logout", post(admin_auth_logout))
         .route("/secrets/openai", post(admin_set_openai_api_key))
         .route("/secrets/openai/delete", post(admin_delete_openai_api_key))
+        .route(
+            "/secrets/slack/signing",
+            post(admin_set_slack_signing_secret),
+        )
+        .route(
+            "/secrets/slack/signing/delete",
+            post(admin_delete_slack_signing_secret),
+        )
+        .route("/secrets/slack/bot", post(admin_set_slack_bot_token))
+        .route(
+            "/secrets/slack/bot/delete",
+            post(admin_delete_slack_bot_token),
+        )
         .route("/tasks", get(admin_tasks))
         .route("/tasks/:id/cancel", post(admin_task_cancel))
         .route("/tasks/:id/retry", post(admin_task_retry))
@@ -133,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
         ));
 
     let app = Router::new()
+        .route("/", get(|| async { Redirect::to("/admin/status") }))
         .route("/healthz", get(healthz))
         .route("/slack/events", post(slack_events))
         .nest("/admin", admin)
@@ -377,8 +391,8 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Html<String>> 
 
     let tpl = StatusTemplate {
         active: "status",
-        slack_signing_secret_set: state.config.slack_signing_secret.is_some(),
-        slack_bot_token_set: state.config.slack_bot_token.is_some(),
+        slack_signing_secret_set: slack_signing_secret_configured(&state).await?,
+        slack_bot_token_set: slack_bot_token_configured(&state).await?,
         openai_api_key_set: openai_api_key_configured(&state).await?,
         master_key_set: state.crypto.is_some(),
         queue_depth,
@@ -403,6 +417,8 @@ async fn admin_settings_get(State(state): State<AppState>) -> AppResult<Html<Str
         shell_network_access: settings.shell_network_access,
         master_key_set: state.crypto.is_some(),
         openai_api_key_set: openai_api_key_configured(&state).await?,
+        slack_signing_secret_set: slack_signing_secret_configured(&state).await?,
+        slack_bot_token_set: slack_bot_token_configured(&state).await?,
     };
     Ok(Html(tpl.render()?))
 }
@@ -471,6 +487,62 @@ async fn admin_delete_openai_api_key(State(state): State<AppState>) -> AppResult
     Ok(Redirect::to("/admin/settings"))
 }
 
+#[derive(Debug, Deserialize)]
+struct SlackSigningSecretForm {
+    slack_signing_secret: String,
+}
+
+async fn admin_set_slack_signing_secret(
+    State(state): State<AppState>,
+    Form(form): Form<SlackSigningSecretForm>,
+) -> AppResult<Redirect> {
+    let Some(crypto) = state.crypto.as_deref() else {
+        return Err(anyhow::anyhow!("GRAIL_MASTER_KEY is required to store secrets").into());
+    };
+
+    let secret = form.slack_signing_secret.trim();
+    if secret.is_empty() {
+        return Ok(Redirect::to("/admin/settings"));
+    }
+
+    let (nonce, ciphertext) = crypto.encrypt(b"slack_signing_secret", secret.as_bytes())?;
+    db::upsert_secret(&state.pool, "slack_signing_secret", &nonce, &ciphertext).await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
+async fn admin_delete_slack_signing_secret(State(state): State<AppState>) -> AppResult<Redirect> {
+    db::delete_secret(&state.pool, "slack_signing_secret").await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackBotTokenForm {
+    slack_bot_token: String,
+}
+
+async fn admin_set_slack_bot_token(
+    State(state): State<AppState>,
+    Form(form): Form<SlackBotTokenForm>,
+) -> AppResult<Redirect> {
+    let Some(crypto) = state.crypto.as_deref() else {
+        return Err(anyhow::anyhow!("GRAIL_MASTER_KEY is required to store secrets").into());
+    };
+
+    let token = form.slack_bot_token.trim();
+    if token.is_empty() {
+        return Ok(Redirect::to("/admin/settings"));
+    }
+
+    let (nonce, ciphertext) = crypto.encrypt(b"slack_bot_token", token.as_bytes())?;
+    db::upsert_secret(&state.pool, "slack_bot_token", &nonce, &ciphertext).await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
+async fn admin_delete_slack_bot_token(State(state): State<AppState>) -> AppResult<Redirect> {
+    db::delete_secret(&state.pool, "slack_bot_token").await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
 fn normalize_optional_string(v: Option<String>) -> Option<String> {
     let Some(s) = v else { return None };
     let s = s.trim();
@@ -479,22 +551,6 @@ fn normalize_optional_string(v: Option<String>) -> Option<String> {
     } else {
         Some(s.to_string())
     }
-}
-
-async fn openai_api_key_configured(state: &AppState) -> anyhow::Result<bool> {
-    if let Ok(v) = std::env::var("OPENAI_API_KEY") {
-        if !v.trim().is_empty() {
-            return Ok(true);
-        }
-    }
-
-    if state.crypto.is_none() {
-        return Ok(false);
-    }
-
-    Ok(db::read_secret(&state.pool, "openai_api_key")
-        .await?
-        .is_some())
 }
 
 async fn admin_tasks(State(state): State<AppState>) -> AppResult<Html<String>> {
@@ -614,11 +670,16 @@ async fn slack_events(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let Some(secret) = state.config.slack_signing_secret.as_deref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "slack not configured").into_response();
+    let secret = match crate::secrets::load_slack_signing_secret_opt(&state).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return (StatusCode::SERVICE_UNAVAILABLE, "slack not configured").into_response(),
+        Err(err) => {
+            warn!(error = %err, "failed to load slack signing secret");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
     };
 
-    if let Err(err) = verify_slack_signature(secret, &headers, &body) {
+    if let Err(err) = verify_slack_signature(&secret, &headers, &body) {
         warn!(error = %err, "invalid slack signature");
         return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
     }
@@ -666,7 +727,7 @@ async fn slack_events(
             }
 
             let thread_ts = thread_ts.unwrap_or_else(|| ts.clone());
-            let prompt = strip_leading_mentions(&text);
+            let prompt = clamp_chars(strip_leading_mentions(&text), 4_000);
 
             let task_id = match db::enqueue_task(
                 &state.pool,
@@ -687,13 +748,21 @@ async fn slack_events(
             };
 
             // Ack immediately, post "Queued" asynchronously.
-            if let Some(slack) = state.slack.clone() {
-                let queued_text = format!("Queued as #{task_id}. I'll start soon.");
-                tokio::spawn(async move {
-                    if let Err(err) = slack.post_message(&channel, &thread_ts, &queued_text).await {
-                        warn!(error = %err, "failed to post queued message");
-                    }
-                });
+            match crate::secrets::load_slack_bot_token_opt(&state).await {
+                Ok(Some(token)) => {
+                    let slack = SlackClient::new(state.http.clone(), token);
+                    let queued_text = format!("Queued as #{task_id}. I'll start soon.");
+                    tokio::spawn(async move {
+                        if let Err(err) = slack.post_message(&channel, &thread_ts, &queued_text).await
+                        {
+                            warn!(error = %err, "failed to post queued message");
+                        }
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(error = %err, "failed to load slack bot token");
+                }
             }
 
             (StatusCode::OK, "").into_response()
@@ -818,6 +887,13 @@ fn strip_leading_mentions(text: &str) -> String {
     }
 
     s.trim().to_string()
+}
+
+fn clamp_chars(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    s.chars().take(max).collect()
 }
 
 #[derive(Debug, Deserialize)]

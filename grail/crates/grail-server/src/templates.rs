@@ -30,6 +30,8 @@ pub struct SettingsTemplate {
     pub shell_network_access: bool,
     pub master_key_set: bool,
     pub openai_api_key_set: bool,
+    pub slack_signing_secret_set: bool,
+    pub slack_bot_token_set: bool,
 }
 
 #[derive(Template)]

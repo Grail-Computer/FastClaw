@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use crate::codex::CodexManager;
 use crate::db;
 use crate::models::Session;
+use crate::slack::SlackClient;
 use crate::AppState;
 
 pub async fn worker_loop(state: AppState) {
@@ -47,6 +48,18 @@ pub async fn worker_loop(state: AppState) {
             }
         }
 
+        // Periodic DB hygiene (only the lock-holder runs this).
+        match db::cleanup_old_tasks(&state.pool, 30).await {
+            Ok(n) if n > 0 => info!(count = n, "cleaned up old tasks"),
+            Ok(_) => {}
+            Err(err) => warn!(error = %err, "failed to cleanup old tasks"),
+        }
+        match db::cleanup_old_processed_events(&state.pool, 7).await {
+            Ok(n) if n > 0 => info!(count = n, "cleaned up old processed events"),
+            Ok(_) => {}
+            Err(err) => warn!(error = %err, "failed to cleanup old processed events"),
+        }
+
         let has_lock = Arc::new(AtomicBool::new(true));
         let has_lock2 = has_lock.clone();
         let pool = state.pool.clone();
@@ -68,7 +81,22 @@ pub async fn worker_loop(state: AppState) {
             }
         });
 
+        let mut last_cleanup = Instant::now();
         while has_lock.load(Ordering::SeqCst) {
+            if last_cleanup.elapsed() >= Duration::from_secs(60 * 60) {
+                match db::cleanup_old_tasks(&state.pool, 30).await {
+                    Ok(n) if n > 0 => info!(count = n, "cleaned up old tasks"),
+                    Ok(_) => {}
+                    Err(err) => warn!(error = %err, "failed to cleanup old tasks"),
+                }
+                match db::cleanup_old_processed_events(&state.pool, 7).await {
+                    Ok(n) if n > 0 => info!(count = n, "cleaned up old processed events"),
+                    Ok(_) => {}
+                    Err(err) => warn!(error = %err, "failed to cleanup old processed events"),
+                }
+                last_cleanup = Instant::now();
+            }
+
             match db::claim_next_task(&state.pool).await {
                 Ok(Some(task)) => {
                     let task_id = task.id;
@@ -82,16 +110,18 @@ pub async fn worker_loop(state: AppState) {
                             }
                         }
                         Err(err) => {
-                            let msg = format!("{err:#}");
-                            warn!(error = %msg, task_id, "task failed");
-                            let _ = db::complete_task_failure(&state.pool, task_id, &msg).await;
+                        let msg = format!("{err:#}");
+                        warn!(error = %msg, task_id, "task failed");
+                        let _ = db::complete_task_failure(&state.pool, task_id, &msg).await;
 
-                            if let Some(slack) = state.slack.as_ref() {
-                                let user_msg = format!(
-                                    "Task #{task_id} failed. Check /admin/tasks for details.\n\nError: {short}",
-                                    short = shorten_error(&msg)
-                                );
-                                let _ = slack
+                        if let Ok(Some(token)) = crate::secrets::load_slack_bot_token_opt(&state).await
+                        {
+                            let slack = SlackClient::new(state.http.clone(), token);
+                            let user_msg = format!(
+                                "Task #{task_id} failed. Check /admin/tasks for details.\n\nError: {short}",
+                                short = shorten_error(&msg)
+                            );
+                            let _ = slack
                                     .post_message(&task.channel_id, &task.thread_ts, &user_msg)
                                     .await;
                             }
@@ -128,9 +158,10 @@ async fn process_task(
 ) -> anyhow::Result<String> {
     let settings = db::get_settings(&state.pool).await?;
 
-    let Some(slack) = state.slack.as_ref() else {
+    let Some(slack_bot_token) = crate::secrets::load_slack_bot_token_opt(state).await? else {
         anyhow::bail!("SLACK_BOT_TOKEN is not configured");
     };
+    let slack = SlackClient::new(state.http.clone(), slack_bot_token.clone());
 
     let ctx = if task.thread_ts != task.event_ts {
         slack.fetch_thread_replies(
@@ -145,7 +176,7 @@ async fn process_task(
             .await?
     };
 
-    let openai_api_key = load_openai_api_key_opt(state).await?;
+    let openai_api_key = crate::secrets::load_openai_api_key_opt(state).await?;
     if openai_api_key.is_none() {
         let codex_home = state.config.effective_codex_home();
         let auth_summary = crate::codex_login::read_auth_summary(&codex_home).await?;
@@ -156,12 +187,12 @@ async fn process_task(
         }
     }
 
-    let allow_slack_mcp = settings.allow_slack_mcp && state.config.slack_bot_token.is_some();
+    let allow_slack_mcp = settings.allow_slack_mcp;
     codex
         .ensure_started(
             openai_api_key.as_deref(),
             if allow_slack_mcp {
-                state.config.slack_bot_token.as_deref()
+                Some(slack_bot_token.as_str())
             } else {
                 None
             },
@@ -258,25 +289,6 @@ async fn process_task(
 
     info!(task_id = task.id, "replied to slack");
     Ok(slack_reply)
-}
-
-async fn load_openai_api_key_opt(state: &AppState) -> anyhow::Result<Option<String>> {
-    if let Ok(v) = std::env::var("OPENAI_API_KEY") {
-        let v = v.trim().to_string();
-        if !v.is_empty() {
-            return Ok(Some(v));
-        }
-    }
-
-    let Some(crypto) = state.crypto.as_deref() else {
-        return Ok(None);
-    };
-    let Some((nonce, ciphertext)) = db::read_secret(&state.pool, "openai_api_key").await? else {
-        return Ok(None);
-    };
-    let plaintext = crypto.decrypt(b"openai_api_key", &nonce, &ciphertext)?;
-    let s = String::from_utf8(plaintext).context("OPENAI_API_KEY not valid utf-8")?;
-    Ok(Some(s))
 }
 
 fn conversation_key_for_task(task: &crate::models::Task) -> String {
