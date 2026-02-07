@@ -5,7 +5,10 @@ use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-use crate::models::{CodexDeviceLogin, PermissionsMode, Session, Settings, Task};
+use crate::models::{
+    Approval, CodexDeviceLogin, CronJob, GuardrailRule, PermissionsMode, Session, Settings, Task,
+    TelegramMessage,
+};
 
 pub async fn init_sqlite(db_path: &Path) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
@@ -37,9 +40,24 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
           reasoning_effort,
           reasoning_summary,
           permissions_mode,
+          workspace_id,
+          slack_allow_from,
+          slack_allow_channels,
+          allow_telegram,
+          telegram_allow_from,
           allow_slack_mcp,
+          allow_web_mcp,
+          extra_mcp_config,
           allow_context_writes,
           shell_network_access,
+          allow_cron,
+          auto_apply_cron_jobs,
+          agent_name,
+          role_description,
+          command_approval_mode,
+          auto_apply_guardrail_tighten,
+          web_allow_domains,
+          web_deny_domains,
           updated_at
         FROM settings
         WHERE id = 1
@@ -57,9 +75,42 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
         permissions_mode: PermissionsMode::from_db_str(
             row.get::<String, _>("permissions_mode").as_str(),
         ),
+        workspace_id: row.get::<Option<String>, _>("workspace_id"),
+        slack_allow_from: row
+            .get::<Option<String>, _>("slack_allow_from")
+            .unwrap_or_default(),
+        slack_allow_channels: row
+            .get::<Option<String>, _>("slack_allow_channels")
+            .unwrap_or_default(),
+        allow_telegram: row.get::<i64, _>("allow_telegram") != 0,
+        telegram_allow_from: row
+            .get::<Option<String>, _>("telegram_allow_from")
+            .unwrap_or_default(),
         allow_slack_mcp: row.get::<i64, _>("allow_slack_mcp") != 0,
+        allow_web_mcp: row.get::<i64, _>("allow_web_mcp") != 0,
+        extra_mcp_config: row
+            .get::<Option<String>, _>("extra_mcp_config")
+            .unwrap_or_default(),
         allow_context_writes: row.get::<i64, _>("allow_context_writes") != 0,
         shell_network_access: row.get::<i64, _>("shell_network_access") != 0,
+        allow_cron: row.get::<i64, _>("allow_cron") != 0,
+        auto_apply_cron_jobs: row.get::<i64, _>("auto_apply_cron_jobs") != 0,
+        agent_name: row
+            .get::<Option<String>, _>("agent_name")
+            .unwrap_or_else(|| "Grail".to_string()),
+        role_description: row
+            .get::<Option<String>, _>("role_description")
+            .unwrap_or_default(),
+        command_approval_mode: row
+            .get::<Option<String>, _>("command_approval_mode")
+            .unwrap_or_else(|| "guardrails".to_string()),
+        auto_apply_guardrail_tighten: row.get::<i64, _>("auto_apply_guardrail_tighten") != 0,
+        web_allow_domains: row
+            .get::<Option<String>, _>("web_allow_domains")
+            .unwrap_or_default(),
+        web_deny_domains: row
+            .get::<Option<String>, _>("web_deny_domains")
+            .unwrap_or_default(),
         updated_at: row.get::<i64, _>("updated_at"),
     })
 }
@@ -68,14 +119,28 @@ pub async fn update_settings(pool: &SqlitePool, settings: &Settings) -> anyhow::
     sqlx::query(
         r#"
         UPDATE settings
-        SET context_last_n = ?1,
-            model = ?2,
-            reasoning_effort = ?3,
-            reasoning_summary = ?4,
-            permissions_mode = ?5,
-            allow_slack_mcp = ?6,
-            allow_context_writes = ?7,
-            shell_network_access = ?8,
+        SET context_last_n = ?,
+            model = ?,
+            reasoning_effort = ?,
+            reasoning_summary = ?,
+            permissions_mode = ?,
+            slack_allow_from = ?,
+            slack_allow_channels = ?,
+            allow_telegram = ?,
+            telegram_allow_from = ?,
+            allow_slack_mcp = ?,
+            allow_web_mcp = ?,
+            extra_mcp_config = ?,
+            allow_context_writes = ?,
+            shell_network_access = ?,
+            allow_cron = ?,
+            auto_apply_cron_jobs = ?,
+            agent_name = ?,
+            role_description = ?,
+            command_approval_mode = ?,
+            auto_apply_guardrail_tighten = ?,
+            web_allow_domains = ?,
+            web_deny_domains = ?,
             updated_at = unixepoch()
         WHERE id = 1
         "#,
@@ -85,13 +150,51 @@ pub async fn update_settings(pool: &SqlitePool, settings: &Settings) -> anyhow::
     .bind(settings.reasoning_effort.as_deref())
     .bind(settings.reasoning_summary.as_deref())
     .bind(settings.permissions_mode.as_db_str())
+    .bind(settings.slack_allow_from.as_str())
+    .bind(settings.slack_allow_channels.as_str())
+    .bind(if settings.allow_telegram { 1 } else { 0 })
+    .bind(settings.telegram_allow_from.as_str())
     .bind(if settings.allow_slack_mcp { 1 } else { 0 })
+    .bind(if settings.allow_web_mcp { 1 } else { 0 })
+    .bind(settings.extra_mcp_config.as_str())
     .bind(if settings.allow_context_writes { 1 } else { 0 })
     .bind(if settings.shell_network_access { 1 } else { 0 })
+    .bind(if settings.allow_cron { 1 } else { 0 })
+    .bind(if settings.auto_apply_cron_jobs { 1 } else { 0 })
+    .bind(settings.agent_name.as_str())
+    .bind(settings.role_description.as_str())
+    .bind(settings.command_approval_mode.as_str())
+    .bind(if settings.auto_apply_guardrail_tighten {
+        1
+    } else {
+        0
+    })
+    .bind(settings.web_allow_domains.as_str())
+    .bind(settings.web_deny_domains.as_str())
     .execute(pool)
     .await
     .context("update settings")?;
     Ok(())
+}
+
+pub async fn set_workspace_id_if_missing(
+    pool: &SqlitePool,
+    workspace_id: &str,
+) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        r#"
+        UPDATE settings
+        SET workspace_id = ?1,
+            updated_at = unixepoch()
+        WHERE id = 1
+          AND (workspace_id IS NULL OR workspace_id = '')
+        "#,
+    )
+    .bind(workspace_id)
+    .execute(pool)
+    .await
+    .context("set workspace_id")?;
+    Ok(res.rows_affected() == 1)
 }
 
 pub async fn upsert_secret(
@@ -163,6 +266,7 @@ pub async fn try_mark_event_processed(
 
 pub async fn enqueue_task(
     pool: &SqlitePool,
+    provider: &str,
     workspace_id: &str,
     channel_id: &str,
     thread_ts: &str,
@@ -173,6 +277,7 @@ pub async fn enqueue_task(
     let res = sqlx::query(
         r#"
         INSERT INTO tasks (
+          provider,
           status,
           workspace_id,
           channel_id,
@@ -182,9 +287,10 @@ pub async fn enqueue_task(
           prompt_text,
           created_at
         )
-        VALUES ('queued', ?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
+        VALUES (?1, 'queued', ?2, ?3, ?4, ?5, ?6, ?7, unixepoch())
         "#,
     )
+    .bind(provider)
     .bind(workspace_id)
     .bind(channel_id)
     .bind(thread_ts)
@@ -198,6 +304,625 @@ pub async fn enqueue_task(
     Ok(res.last_insert_rowid())
 }
 
+pub async fn list_cron_jobs(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<CronJob>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          id,
+          name,
+          enabled,
+          mode,
+          schedule_kind,
+          every_seconds,
+          cron_expr,
+          at_ts,
+          workspace_id,
+          channel_id,
+          thread_ts,
+          prompt_text,
+          next_run_at,
+          last_run_at,
+          last_status,
+          last_error,
+          created_at,
+          updated_at
+        FROM cron_jobs
+        ORDER BY created_at DESC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("list cron jobs")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| CronJob {
+            id: r.get::<String, _>("id"),
+            name: r.get::<String, _>("name"),
+            enabled: r.get::<i64, _>("enabled") != 0,
+            mode: r
+                .get::<Option<String>, _>("mode")
+                .unwrap_or_else(|| "agent".to_string()),
+            schedule_kind: r.get::<String, _>("schedule_kind"),
+            every_seconds: r.get::<Option<i64>, _>("every_seconds"),
+            cron_expr: r.get::<Option<String>, _>("cron_expr"),
+            at_ts: r.get::<Option<i64>, _>("at_ts"),
+            workspace_id: r.get::<String, _>("workspace_id"),
+            channel_id: r.get::<String, _>("channel_id"),
+            thread_ts: r.get::<String, _>("thread_ts"),
+            prompt_text: r.get::<String, _>("prompt_text"),
+            next_run_at: r.get::<Option<i64>, _>("next_run_at"),
+            last_run_at: r.get::<Option<i64>, _>("last_run_at"),
+            last_status: r.get::<Option<String>, _>("last_status"),
+            last_error: r.get::<Option<String>, _>("last_error"),
+            created_at: r.get::<i64, _>("created_at"),
+            updated_at: r.get::<i64, _>("updated_at"),
+        })
+        .collect())
+}
+
+pub async fn insert_cron_job(pool: &SqlitePool, job: &CronJob) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cron_jobs (
+          id,
+          name,
+          enabled,
+          mode,
+          schedule_kind,
+          every_seconds,
+          cron_expr,
+          at_ts,
+          workspace_id,
+          channel_id,
+          thread_ts,
+          prompt_text,
+          next_run_at,
+          last_run_at,
+          last_status,
+          last_error,
+          created_at,
+          updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        "#,
+    )
+    .bind(&job.id)
+    .bind(&job.name)
+    .bind(if job.enabled { 1 } else { 0 })
+    .bind(&job.mode)
+    .bind(&job.schedule_kind)
+    .bind(job.every_seconds)
+    .bind(job.cron_expr.as_deref())
+    .bind(job.at_ts)
+    .bind(&job.workspace_id)
+    .bind(&job.channel_id)
+    .bind(&job.thread_ts)
+    .bind(&job.prompt_text)
+    .bind(job.next_run_at)
+    .bind(job.last_run_at)
+    .bind(job.last_status.as_deref())
+    .bind(job.last_error.as_deref())
+    .bind(job.created_at)
+    .bind(job.updated_at)
+    .execute(pool)
+    .await
+    .context("insert cron job")?;
+    Ok(())
+}
+
+pub async fn delete_cron_job(pool: &SqlitePool, id: &str) -> anyhow::Result<bool> {
+    let res = sqlx::query("DELETE FROM cron_jobs WHERE id = ?1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("delete cron job")?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub async fn set_cron_job_enabled(
+    pool: &SqlitePool,
+    id: &str,
+    enabled: bool,
+) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        r#"
+        UPDATE cron_jobs
+        SET enabled = ?2,
+            updated_at = unixepoch()
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .bind(if enabled { 1 } else { 0 })
+    .execute(pool)
+    .await
+    .context("set cron job enabled")?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub async fn claim_due_cron_jobs(
+    pool: &SqlitePool,
+    now_ts: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<CronJob>> {
+    let mut tx = pool.begin().await.context("begin tx")?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          id,
+          name,
+          enabled,
+          mode,
+          schedule_kind,
+          every_seconds,
+          cron_expr,
+          at_ts,
+          workspace_id,
+          channel_id,
+          thread_ts,
+          prompt_text,
+          next_run_at,
+          last_run_at,
+          last_status,
+          last_error,
+          created_at,
+          updated_at
+        FROM cron_jobs
+        WHERE enabled = 1
+          AND next_run_at IS NOT NULL
+          AND next_run_at <= ?1
+        ORDER BY next_run_at ASC
+        LIMIT ?2
+        "#,
+    )
+    .bind(now_ts)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await
+    .context("select due cron jobs")?;
+
+    // Mark claimed with last_run_at and last_status='queued' (next_run_at will be computed in app code).
+    for r in &rows {
+        let id = r.get::<String, _>("id");
+        sqlx::query(
+            r#"
+            UPDATE cron_jobs
+            SET last_run_at = ?2,
+                last_status = 'queued',
+                last_error = NULL,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            "#,
+        )
+        .bind(&id)
+        .bind(now_ts)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("mark cron job claimed {id}"))?;
+    }
+
+    tx.commit().await.context("commit tx")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| CronJob {
+            id: r.get::<String, _>("id"),
+            name: r.get::<String, _>("name"),
+            enabled: r.get::<i64, _>("enabled") != 0,
+            mode: r
+                .get::<Option<String>, _>("mode")
+                .unwrap_or_else(|| "agent".to_string()),
+            schedule_kind: r.get::<String, _>("schedule_kind"),
+            every_seconds: r.get::<Option<i64>, _>("every_seconds"),
+            cron_expr: r.get::<Option<String>, _>("cron_expr"),
+            at_ts: r.get::<Option<i64>, _>("at_ts"),
+            workspace_id: r.get::<String, _>("workspace_id"),
+            channel_id: r.get::<String, _>("channel_id"),
+            thread_ts: r.get::<String, _>("thread_ts"),
+            prompt_text: r.get::<String, _>("prompt_text"),
+            next_run_at: r.get::<Option<i64>, _>("next_run_at"),
+            last_run_at: r.get::<Option<i64>, _>("last_run_at"),
+            last_status: r.get::<Option<String>, _>("last_status"),
+            last_error: r.get::<Option<String>, _>("last_error"),
+            created_at: r.get::<i64, _>("created_at"),
+            updated_at: r.get::<i64, _>("updated_at"),
+        })
+        .collect())
+}
+
+pub async fn update_cron_job_next_run_at(
+    pool: &SqlitePool,
+    id: &str,
+    next_run_at: Option<i64>,
+    enabled: bool,
+    last_status: Option<&str>,
+    last_error: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE cron_jobs
+        SET next_run_at = ?2,
+            enabled = ?3,
+            last_status = COALESCE(?4, last_status),
+            last_error = ?5,
+            updated_at = unixepoch()
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .bind(next_run_at)
+    .bind(if enabled { 1 } else { 0 })
+    .bind(last_status)
+    .bind(last_error)
+    .execute(pool)
+    .await
+    .context("update cron job next_run_at")?;
+    Ok(())
+}
+
+pub async fn list_guardrail_rules(
+    pool: &SqlitePool,
+    kind: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<Vec<GuardrailRule>> {
+    let rows = if let Some(kind) = kind {
+        sqlx::query(
+            r#"
+            SELECT
+              id,
+              name,
+              kind,
+              pattern_kind,
+              pattern,
+              action,
+              priority,
+              enabled,
+              created_at,
+              updated_at
+            FROM guardrail_rules
+            WHERE kind = ?1
+            ORDER BY enabled DESC, priority ASC, created_at ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(kind)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list guardrail rules (kind)")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT
+              id,
+              name,
+              kind,
+              pattern_kind,
+              pattern,
+              action,
+              priority,
+              enabled,
+              created_at,
+              updated_at
+            FROM guardrail_rules
+            ORDER BY kind ASC, enabled DESC, priority ASC, created_at ASC
+            LIMIT ?1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list guardrail rules")?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|r| GuardrailRule {
+            id: r.get::<String, _>("id"),
+            name: r.get::<String, _>("name"),
+            kind: r.get::<String, _>("kind"),
+            pattern_kind: r.get::<String, _>("pattern_kind"),
+            pattern: r.get::<String, _>("pattern"),
+            action: r.get::<String, _>("action"),
+            priority: r.get::<i64, _>("priority"),
+            enabled: r.get::<i64, _>("enabled") != 0,
+            created_at: r.get::<i64, _>("created_at"),
+            updated_at: r.get::<i64, _>("updated_at"),
+        })
+        .collect())
+}
+
+pub async fn insert_guardrail_rule(pool: &SqlitePool, rule: &GuardrailRule) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO guardrail_rules (
+          id,
+          name,
+          kind,
+          pattern_kind,
+          pattern,
+          action,
+          priority,
+          enabled,
+          created_at,
+          updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&rule.id)
+    .bind(&rule.name)
+    .bind(&rule.kind)
+    .bind(&rule.pattern_kind)
+    .bind(&rule.pattern)
+    .bind(&rule.action)
+    .bind(rule.priority)
+    .bind(if rule.enabled { 1 } else { 0 })
+    .bind(rule.created_at)
+    .bind(rule.updated_at)
+    .execute(pool)
+    .await
+    .context("insert guardrail rule")?;
+    Ok(())
+}
+
+pub async fn delete_guardrail_rule(pool: &SqlitePool, id: &str) -> anyhow::Result<bool> {
+    let res = sqlx::query("DELETE FROM guardrail_rules WHERE id = ?1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("delete guardrail rule")?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub async fn set_guardrail_rule_enabled(
+    pool: &SqlitePool,
+    id: &str,
+    enabled: bool,
+) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        r#"
+        UPDATE guardrail_rules
+        SET enabled = ?2,
+            updated_at = unixepoch()
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .bind(if enabled { 1 } else { 0 })
+    .execute(pool)
+    .await
+    .context("set guardrail rule enabled")?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub async fn insert_approval(pool: &SqlitePool, approval: &Approval) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO approvals (
+          id,
+          kind,
+          status,
+          decision,
+          workspace_id,
+          channel_id,
+          thread_ts,
+          requested_by_user_id,
+          details_json,
+          created_at,
+          updated_at,
+          resolved_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&approval.id)
+    .bind(&approval.kind)
+    .bind(&approval.status)
+    .bind(approval.decision.as_deref())
+    .bind(approval.workspace_id.as_deref())
+    .bind(approval.channel_id.as_deref())
+    .bind(approval.thread_ts.as_deref())
+    .bind(approval.requested_by_user_id.as_deref())
+    .bind(&approval.details_json)
+    .bind(approval.created_at)
+    .bind(approval.updated_at)
+    .bind(approval.resolved_at)
+    .execute(pool)
+    .await
+    .context("insert approval")?;
+    Ok(())
+}
+
+pub async fn get_approval(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<Approval>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          id,
+          kind,
+          status,
+          decision,
+          workspace_id,
+          channel_id,
+          thread_ts,
+          requested_by_user_id,
+          details_json,
+          created_at,
+          updated_at,
+          resolved_at
+        FROM approvals
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("get approval")?;
+
+    Ok(row.map(|r| Approval {
+        id: r.get::<String, _>("id"),
+        kind: r.get::<String, _>("kind"),
+        status: r.get::<String, _>("status"),
+        decision: r.get::<Option<String>, _>("decision"),
+        workspace_id: r.get::<Option<String>, _>("workspace_id"),
+        channel_id: r.get::<Option<String>, _>("channel_id"),
+        thread_ts: r.get::<Option<String>, _>("thread_ts"),
+        requested_by_user_id: r.get::<Option<String>, _>("requested_by_user_id"),
+        details_json: r.get::<String, _>("details_json"),
+        created_at: r.get::<i64, _>("created_at"),
+        updated_at: r.get::<i64, _>("updated_at"),
+        resolved_at: r.get::<Option<i64>, _>("resolved_at"),
+    }))
+}
+
+pub async fn list_recent_approvals(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Approval>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          id,
+          kind,
+          status,
+          decision,
+          workspace_id,
+          channel_id,
+          thread_ts,
+          requested_by_user_id,
+          details_json,
+          created_at,
+          updated_at,
+          resolved_at
+        FROM approvals
+        ORDER BY created_at DESC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("list approvals")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| Approval {
+            id: r.get::<String, _>("id"),
+            kind: r.get::<String, _>("kind"),
+            status: r.get::<String, _>("status"),
+            decision: r.get::<Option<String>, _>("decision"),
+            workspace_id: r.get::<Option<String>, _>("workspace_id"),
+            channel_id: r.get::<Option<String>, _>("channel_id"),
+            thread_ts: r.get::<Option<String>, _>("thread_ts"),
+            requested_by_user_id: r.get::<Option<String>, _>("requested_by_user_id"),
+            details_json: r.get::<String, _>("details_json"),
+            created_at: r.get::<i64, _>("created_at"),
+            updated_at: r.get::<i64, _>("updated_at"),
+            resolved_at: r.get::<Option<i64>, _>("resolved_at"),
+        })
+        .collect())
+}
+
+pub async fn resolve_approval(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    decision: &str,
+) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        r#"
+        UPDATE approvals
+        SET status = ?2,
+            decision = ?3,
+            resolved_at = unixepoch(),
+            updated_at = unixepoch()
+        WHERE id = ?1
+          AND status = 'pending'
+        "#,
+    )
+    .bind(id)
+    .bind(status)
+    .bind(decision)
+    .execute(pool)
+    .await
+    .context("resolve approval")?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub async fn expire_approval(pool: &SqlitePool, id: &str) -> anyhow::Result<()> {
+    let _ = sqlx::query(
+        r#"
+        UPDATE approvals
+        SET status = 'expired',
+            decision = NULL,
+            resolved_at = unixepoch(),
+            updated_at = unixepoch()
+        WHERE id = ?1
+          AND status = 'pending'
+        "#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("expire approval")?;
+    Ok(())
+}
+
+pub async fn set_runtime_active_task(
+    pool: &SqlitePool,
+    task_id: Option<i64>,
+) -> anyhow::Result<()> {
+    if let Some(id) = task_id {
+        sqlx::query(
+            r#"
+            UPDATE runtime_state
+            SET active_task_id = ?1,
+                active_task_started_at = unixepoch(),
+                updated_at = unixepoch()
+            WHERE id = 1
+            "#,
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("set runtime active task")?;
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE runtime_state
+            SET active_task_id = NULL,
+                active_task_started_at = NULL,
+                updated_at = unixepoch()
+            WHERE id = 1
+            "#,
+        )
+        .execute(pool)
+        .await
+        .context("clear runtime active task")?;
+    }
+    Ok(())
+}
+
+pub async fn get_runtime_active_task(pool: &SqlitePool) -> anyhow::Result<Option<(i64, i64)>> {
+    let row = sqlx::query(
+        r#"
+        SELECT active_task_id, active_task_started_at
+        FROM runtime_state
+        WHERE id = 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .context("get runtime state")?;
+
+    Ok(row.and_then(|r| {
+        let id = r.get::<Option<i64>, _>("active_task_id")?;
+        let started_at = r.get::<Option<i64>, _>("active_task_started_at")?;
+        Some((id, started_at))
+    }))
+}
+
 pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> {
     let mut tx = pool.begin().await.context("begin tx")?;
 
@@ -206,6 +931,7 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
         SELECT
           id,
           status,
+          provider,
           workspace_id,
           channel_id,
           thread_ts,
@@ -257,6 +983,9 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
     Ok(Some(Task {
         id,
         status: "running".to_string(),
+        provider: row
+            .get::<Option<String>, _>("provider")
+            .unwrap_or_else(|| "slack".to_string()),
         workspace_id: row.get::<String, _>("workspace_id"),
         channel_id: row.get::<String, _>("channel_id"),
         thread_ts: row.get::<String, _>("thread_ts"),
@@ -608,6 +1337,7 @@ pub async fn list_recent_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<
         SELECT
           id,
           status,
+          provider,
           workspace_id,
           channel_id,
           thread_ts,
@@ -634,6 +1364,9 @@ pub async fn list_recent_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<
         .map(|row| Task {
             id: row.get::<i64, _>("id"),
             status: row.get::<String, _>("status"),
+            provider: row
+                .get::<Option<String>, _>("provider")
+                .unwrap_or_else(|| "slack".to_string()),
             workspace_id: row.get::<String, _>("workspace_id"),
             channel_id: row.get::<String, _>("channel_id"),
             thread_ts: row.get::<String, _>("thread_ts"),
@@ -700,4 +1433,116 @@ pub async fn upsert_session(pool: &SqlitePool, session: &Session) -> anyhow::Res
     .await
     .context("upsert session")?;
     Ok(())
+}
+
+pub async fn insert_telegram_message(
+    pool: &SqlitePool,
+    msg: &TelegramMessage,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO telegram_messages (
+          chat_id,
+          message_id,
+          from_user_id,
+          is_bot,
+          text,
+          ts
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(chat_id, message_id) DO NOTHING
+        "#,
+    )
+    .bind(&msg.chat_id)
+    .bind(msg.message_id)
+    .bind(msg.from_user_id.as_deref())
+    .bind(if msg.is_bot { 1 } else { 0 })
+    .bind(msg.text.as_deref())
+    .bind(msg.ts)
+    .execute(pool)
+    .await
+    .context("insert telegram message")?;
+    Ok(())
+}
+
+pub async fn fetch_telegram_context(
+    pool: &SqlitePool,
+    chat_id: &str,
+    before_message_id: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<TelegramMessage>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          chat_id,
+          message_id,
+          from_user_id,
+          is_bot,
+          text,
+          ts
+        FROM telegram_messages
+        WHERE chat_id = ?1
+          AND message_id < ?2
+        ORDER BY message_id DESC
+        LIMIT ?3
+        "#,
+    )
+    .bind(chat_id)
+    .bind(before_message_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("fetch telegram context")?;
+
+    let mut out: Vec<TelegramMessage> = rows
+        .into_iter()
+        .map(|r| TelegramMessage {
+            chat_id: r.get::<String, _>("chat_id"),
+            message_id: r.get::<i64, _>("message_id"),
+            from_user_id: r.get::<Option<String>, _>("from_user_id"),
+            is_bot: r.get::<i64, _>("is_bot") != 0,
+            text: r.get::<Option<String>, _>("text"),
+            ts: r.get::<i64, _>("ts"),
+        })
+        .collect();
+    out.reverse(); // oldest -> newest
+    Ok(out)
+}
+
+pub async fn list_sessions(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Session>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          conversation_key,
+          codex_thread_id,
+          memory_summary,
+          last_used_at
+        FROM sessions
+        ORDER BY last_used_at DESC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("list sessions")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| Session {
+            conversation_key: r.get::<String, _>("conversation_key"),
+            codex_thread_id: r.get::<Option<String>, _>("codex_thread_id"),
+            memory_summary: r.get::<String, _>("memory_summary"),
+            last_used_at: r.get::<i64, _>("last_used_at"),
+        })
+        .collect())
+}
+
+pub async fn delete_session(pool: &SqlitePool, conversation_key: &str) -> anyhow::Result<bool> {
+    let res = sqlx::query("DELETE FROM sessions WHERE conversation_key = ?1")
+        .bind(conversation_key)
+        .execute(pool)
+        .await
+        .context("delete session")?;
+    Ok(res.rows_affected() == 1)
 }

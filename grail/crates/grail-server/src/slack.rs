@@ -94,7 +94,7 @@ impl SlackClient {
     pub async fn post_message(
         &self,
         channel: &str,
-        thread_ts: &str,
+        thread_ts: Option<&str>,
         text: &str,
     ) -> anyhow::Result<()> {
         const SLACK_TEXT_MAX_BYTES: usize = 35_000;
@@ -103,7 +103,8 @@ impl SlackClient {
         struct Req<'a> {
             channel: &'a str,
             text: &'a str,
-            thread_ts: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            thread_ts: Option<&'a str>,
         }
 
         for chunk in split_slack_text(text, SLACK_TEXT_MAX_BYTES) {
@@ -130,6 +131,60 @@ impl SlackClient {
                 );
             }
         }
+        Ok(())
+    }
+
+    pub async fn post_message_rich(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+        blocks: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        const SLACK_TEXT_MAX_BYTES: usize = 35_000;
+
+        #[derive(Serialize)]
+        struct Req<'a> {
+            channel: &'a str,
+            text: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            thread_ts: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            blocks: Option<&'a serde_json::Value>,
+        }
+
+        let mut t = text.trim().to_string();
+        if t.is_empty() {
+            t = "(empty)".to_string();
+        }
+        if t.len() > SLACK_TEXT_MAX_BYTES {
+            t = t.chars().take(SLACK_TEXT_MAX_BYTES).collect();
+        }
+
+        let resp: SlackApiResponse<serde_json::Value> = self
+            .http
+            .post("https://slack.com/api/chat.postMessage")
+            .headers(self.headers())
+            .json(&Req {
+                channel,
+                text: &t,
+                thread_ts,
+                blocks: Some(&blocks),
+            })
+            .send()
+            .await
+            .context("slack chat.postMessage request")?
+            .json()
+            .await
+            .context("slack chat.postMessage decode")?;
+
+        if !resp.ok {
+            anyhow::bail!(
+                "slack chat.postMessage failed: {}",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string())
+            );
+        }
+
         Ok(())
     }
 

@@ -1,22 +1,28 @@
+mod approvals;
 mod bootstrap;
 mod codex;
 mod codex_login;
 mod config;
+mod cron_expr;
 mod crypto;
 mod db;
+mod guardrails;
 mod models;
 mod secrets;
 mod slack;
+mod telegram;
 mod templates;
 mod worker;
 
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use askama::Template;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Form, Path, State};
+use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -25,6 +31,7 @@ use axum::Router;
 use clap::Parser;
 use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
+use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -33,11 +40,15 @@ use crate::config::Config;
 use crate::crypto::{parse_master_key, Crypto};
 use crate::models::PermissionsMode;
 use crate::secrets::{
-    openai_api_key_configured, slack_bot_token_configured, slack_signing_secret_configured,
+    brave_search_api_key_configured, openai_api_key_configured, slack_bot_token_configured,
+    slack_signing_secret_configured, telegram_bot_token_configured,
+    telegram_webhook_secret_configured,
 };
 use crate::slack::{verify_slack_signature, SlackClient};
 use crate::templates::{
-    AuthTemplate, DeviceLoginRow, SettingsTemplate, StatusTemplate, TasksTemplate,
+    ApprovalsTemplate, AuthTemplate, ContextEditTemplate, ContextTemplate, CronTemplate,
+    DeviceLoginRow, GuardrailsTemplate, MemoryTemplate, SettingsTemplate, StatusTemplate,
+    TasksTemplate,
 };
 
 type AppResult<T> = Result<T, AppError>;
@@ -76,6 +87,7 @@ struct AppState {
     pool: SqlitePool,
     http: reqwest::Client,
     crypto: Option<Arc<Crypto>>,
+    telegram_bot_username: Arc<RwLock<Option<String>>>,
 }
 
 #[tokio::main]
@@ -111,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
                     None
                 }
             }),
+        telegram_bot_username: Arc::new(RwLock::new(None)),
     };
 
     // Background worker (single concurrency).
@@ -129,6 +142,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/logout", post(admin_auth_logout))
         .route("/secrets/openai", post(admin_set_openai_api_key))
         .route("/secrets/openai/delete", post(admin_delete_openai_api_key))
+        .route("/secrets/brave", post(admin_set_brave_search_api_key))
+        .route(
+            "/secrets/brave/delete",
+            post(admin_delete_brave_search_api_key),
+        )
         .route(
             "/secrets/slack/signing",
             post(admin_set_slack_signing_secret),
@@ -142,9 +160,43 @@ async fn main() -> anyhow::Result<()> {
             "/secrets/slack/bot/delete",
             post(admin_delete_slack_bot_token),
         )
+        .route("/secrets/telegram/bot", post(admin_set_telegram_bot_token))
+        .route(
+            "/secrets/telegram/bot/delete",
+            post(admin_delete_telegram_bot_token),
+        )
+        .route(
+            "/secrets/telegram/webhook",
+            post(admin_set_telegram_webhook_secret),
+        )
+        .route(
+            "/secrets/telegram/webhook/delete",
+            post(admin_delete_telegram_webhook_secret),
+        )
         .route("/tasks", get(admin_tasks))
         .route("/tasks/{id}/cancel", post(admin_task_cancel))
         .route("/tasks/{id}/retry", post(admin_task_retry))
+        .route("/cron", get(admin_cron_get))
+        .route("/cron/add", post(admin_cron_add))
+        .route("/cron/{id}/delete", post(admin_cron_delete))
+        .route("/cron/{id}/enable", post(admin_cron_enable))
+        .route("/cron/{id}/disable", post(admin_cron_disable))
+        .route("/guardrails", get(admin_guardrails_get))
+        .route("/guardrails/add", post(admin_guardrails_add))
+        .route("/guardrails/{id}/delete", post(admin_guardrails_delete))
+        .route("/guardrails/{id}/enable", post(admin_guardrails_enable))
+        .route("/guardrails/{id}/disable", post(admin_guardrails_disable))
+        .route("/approvals", get(admin_approvals_get))
+        .route("/approvals/{id}/approve", post(admin_approval_approve))
+        .route("/approvals/{id}/always", post(admin_approval_always))
+        .route("/approvals/{id}/deny", post(admin_approval_deny))
+        .route("/memory", get(admin_memory_get))
+        .route("/memory/clear", post(admin_memory_clear))
+        .route("/context", get(admin_context_get))
+        .route(
+            "/context/edit",
+            get(admin_context_edit_get).post(admin_context_edit_post),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_basic_auth,
@@ -154,6 +206,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(|| async { Redirect::to("/admin/status") }))
         .route("/healthz", get(healthz))
         .route("/slack/events", post(slack_events))
+        .route("/slack/actions", post(slack_actions))
+        .route("/telegram/webhook", post(telegram_webhook))
         .nest("/admin", admin)
         .with_state(state)
         .layer(DefaultBodyLimit::max(1024 * 1024))
@@ -390,6 +444,18 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Html<String>> 
         .await?
         .unwrap_or_else(|| "(none)".to_string());
 
+    let active_task = db::get_runtime_active_task(&state.pool).await?;
+    let pending_approvals: i64 =
+        sqlx::query("SELECT COUNT(*) AS c FROM approvals WHERE status = 'pending'")
+            .fetch_one(&state.pool)
+            .await?
+            .get::<i64, _>("c");
+    let guardrails_enabled: i64 =
+        sqlx::query("SELECT COUNT(*) AS c FROM guardrail_rules WHERE enabled = 1")
+            .fetch_one(&state.pool)
+            .await?
+            .get::<i64, _>("c");
+
     let slack_events_url = state
         .config
         .base_url
@@ -397,16 +463,44 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Html<String>> 
         .map(|b| format!("{}/slack/events", b.trim_end_matches('/')))
         .unwrap_or_else(|| "/slack/events".to_string());
 
+    let slack_actions_url = state
+        .config
+        .base_url
+        .as_deref()
+        .map(|b| format!("{}/slack/actions", b.trim_end_matches('/')))
+        .unwrap_or_else(|| "/slack/actions".to_string());
+
+    let telegram_webhook_url = state
+        .config
+        .base_url
+        .as_deref()
+        .map(|b| format!("{}/telegram/webhook", b.trim_end_matches('/')))
+        .unwrap_or_else(|| "/telegram/webhook".to_string());
+
     let tpl = StatusTemplate {
         active: "status",
         slack_signing_secret_set: slack_signing_secret_configured(&state).await?,
         slack_bot_token_set: slack_bot_token_configured(&state).await?,
+        telegram_bot_token_set: telegram_bot_token_configured(&state).await?,
+        telegram_webhook_secret_set: telegram_webhook_secret_configured(&state).await?,
         openai_api_key_set: openai_api_key_configured(&state).await?,
         master_key_set: state.crypto.is_some(),
         queue_depth,
         permissions_mode: settings.permissions_mode.as_db_str().to_string(),
         slack_events_url,
+        slack_actions_url,
+        telegram_webhook_url,
         worker_lock_owner,
+        active_task_id: active_task
+            .as_ref()
+            .map(|(id, _)| format!("{id}"))
+            .unwrap_or_default(),
+        active_task_started_at: active_task
+            .as_ref()
+            .map(|(_, ts)| format!("{ts}"))
+            .unwrap_or_default(),
+        pending_approvals,
+        guardrails_enabled,
     };
     Ok(Html(tpl.render()?))
 }
@@ -420,13 +514,30 @@ async fn admin_settings_get(State(state): State<AppState>) -> AppResult<Html<Str
         reasoning_effort: settings.reasoning_effort.unwrap_or_default(),
         reasoning_summary: settings.reasoning_summary.unwrap_or_default(),
         permissions_mode: settings.permissions_mode.as_db_str().to_string(),
+        slack_allow_from: settings.slack_allow_from,
+        slack_allow_channels: settings.slack_allow_channels,
+        allow_telegram: settings.allow_telegram,
+        telegram_allow_from: settings.telegram_allow_from,
         allow_slack_mcp: settings.allow_slack_mcp,
+        allow_web_mcp: settings.allow_web_mcp,
+        extra_mcp_config: settings.extra_mcp_config,
         allow_context_writes: settings.allow_context_writes,
         shell_network_access: settings.shell_network_access,
+        allow_cron: settings.allow_cron,
+        auto_apply_cron_jobs: settings.auto_apply_cron_jobs,
+        agent_name: settings.agent_name,
+        role_description: settings.role_description,
+        command_approval_mode: settings.command_approval_mode,
+        auto_apply_guardrail_tighten: settings.auto_apply_guardrail_tighten,
+        web_allow_domains: settings.web_allow_domains,
+        web_deny_domains: settings.web_deny_domains,
         master_key_set: state.crypto.is_some(),
         openai_api_key_set: openai_api_key_configured(&state).await?,
         slack_signing_secret_set: slack_signing_secret_configured(&state).await?,
         slack_bot_token_set: slack_bot_token_configured(&state).await?,
+        telegram_bot_token_set: telegram_bot_token_configured(&state).await?,
+        telegram_webhook_secret_set: telegram_webhook_secret_configured(&state).await?,
+        brave_search_api_key_set: brave_search_api_key_configured(&state).await?,
     };
     Ok(Html(tpl.render()?))
 }
@@ -438,9 +549,23 @@ struct SettingsForm {
     reasoning_effort: Option<String>,
     reasoning_summary: Option<String>,
     permissions_mode: String,
+    slack_allow_from: String,
+    slack_allow_channels: String,
+    allow_telegram: Option<String>,
+    telegram_allow_from: String,
     allow_slack_mcp: Option<String>,
+    allow_web_mcp: Option<String>,
+    extra_mcp_config: String,
     allow_context_writes: Option<String>,
     shell_network_access: Option<String>,
+    allow_cron: Option<String>,
+    auto_apply_cron_jobs: Option<String>,
+    agent_name: String,
+    role_description: String,
+    command_approval_mode: String,
+    auto_apply_guardrail_tighten: Option<String>,
+    web_allow_domains: String,
+    web_deny_domains: String,
 }
 
 async fn admin_settings_post(
@@ -459,9 +584,40 @@ async fn admin_settings_post(
     settings.reasoning_effort = normalize_optional_string(form.reasoning_effort);
     settings.reasoning_summary = normalize_optional_string(form.reasoning_summary);
 
+    // Comma/whitespace/newline separated Slack user IDs (e.g. U0123...).
+    settings.slack_allow_from = clamp_chars(form.slack_allow_from.trim().to_string(), 2_000);
+    // Optional channel allow list (C/G IDs).
+    settings.slack_allow_channels =
+        clamp_chars(form.slack_allow_channels.trim().to_string(), 2_000);
+
+    settings.allow_telegram = form.allow_telegram.is_some();
+    // Comma/whitespace/newline separated Telegram user IDs (integers).
+    settings.telegram_allow_from = clamp_chars(form.telegram_allow_from.trim().to_string(), 2_000);
+
     settings.allow_slack_mcp = form.allow_slack_mcp.is_some();
+    settings.allow_web_mcp = form.allow_web_mcp.is_some();
+    settings.extra_mcp_config = clamp_chars(form.extra_mcp_config, 60_000);
     settings.allow_context_writes = form.allow_context_writes.is_some();
     settings.shell_network_access = form.shell_network_access.is_some();
+    settings.allow_cron = form.allow_cron.is_some();
+    settings.auto_apply_cron_jobs = form.auto_apply_cron_jobs.is_some();
+
+    settings.agent_name = {
+        let v = clamp_chars(form.agent_name.trim().to_string(), 48);
+        if v.is_empty() {
+            "Grail".to_string()
+        } else {
+            v
+        }
+    };
+    settings.role_description = clamp_chars(form.role_description.trim().to_string(), 8_000);
+    settings.command_approval_mode = match form.command_approval_mode.as_str() {
+        "auto" | "guardrails" | "always_ask" => form.command_approval_mode,
+        _ => "guardrails".to_string(),
+    };
+    settings.auto_apply_guardrail_tighten = form.auto_apply_guardrail_tighten.is_some();
+    settings.web_allow_domains = clamp_chars(form.web_allow_domains.trim().to_string(), 2_000);
+    settings.web_deny_domains = clamp_chars(form.web_deny_domains.trim().to_string(), 2_000);
 
     db::update_settings(&state.pool, &settings).await?;
     Ok(Redirect::to("/admin/settings"))
@@ -492,6 +648,34 @@ async fn admin_set_openai_api_key(
 
 async fn admin_delete_openai_api_key(State(state): State<AppState>) -> AppResult<Redirect> {
     db::delete_secret(&state.pool, "openai_api_key").await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveKeyForm {
+    brave_search_api_key: String,
+}
+
+async fn admin_set_brave_search_api_key(
+    State(state): State<AppState>,
+    Form(form): Form<BraveKeyForm>,
+) -> AppResult<Redirect> {
+    let Some(crypto) = state.crypto.as_deref() else {
+        return Err(anyhow::anyhow!("GRAIL_MASTER_KEY is required to store secrets").into());
+    };
+
+    let key = form.brave_search_api_key.trim();
+    if key.is_empty() {
+        return Ok(Redirect::to("/admin/settings"));
+    }
+
+    let (nonce, ciphertext) = crypto.encrypt(b"brave_search_api_key", key.as_bytes())?;
+    db::upsert_secret(&state.pool, "brave_search_api_key", &nonce, &ciphertext).await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
+async fn admin_delete_brave_search_api_key(State(state): State<AppState>) -> AppResult<Redirect> {
+    db::delete_secret(&state.pool, "brave_search_api_key").await?;
     Ok(Redirect::to("/admin/settings"))
 }
 
@@ -551,6 +735,64 @@ async fn admin_delete_slack_bot_token(State(state): State<AppState>) -> AppResul
     Ok(Redirect::to("/admin/settings"))
 }
 
+#[derive(Debug, Deserialize)]
+struct TelegramBotTokenForm {
+    telegram_bot_token: String,
+}
+
+async fn admin_set_telegram_bot_token(
+    State(state): State<AppState>,
+    Form(form): Form<TelegramBotTokenForm>,
+) -> AppResult<Redirect> {
+    let Some(crypto) = state.crypto.as_deref() else {
+        return Err(anyhow::anyhow!("GRAIL_MASTER_KEY is required to store secrets").into());
+    };
+
+    let token = form.telegram_bot_token.trim();
+    if token.is_empty() {
+        return Ok(Redirect::to("/admin/settings"));
+    }
+
+    let (nonce, ciphertext) = crypto.encrypt(b"telegram_bot_token", token.as_bytes())?;
+    db::upsert_secret(&state.pool, "telegram_bot_token", &nonce, &ciphertext).await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
+async fn admin_delete_telegram_bot_token(State(state): State<AppState>) -> AppResult<Redirect> {
+    db::delete_secret(&state.pool, "telegram_bot_token").await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramWebhookSecretForm {
+    telegram_webhook_secret: String,
+}
+
+async fn admin_set_telegram_webhook_secret(
+    State(state): State<AppState>,
+    Form(form): Form<TelegramWebhookSecretForm>,
+) -> AppResult<Redirect> {
+    let Some(crypto) = state.crypto.as_deref() else {
+        return Err(anyhow::anyhow!("GRAIL_MASTER_KEY is required to store secrets").into());
+    };
+
+    let secret = form.telegram_webhook_secret.trim();
+    if secret.is_empty() {
+        return Ok(Redirect::to("/admin/settings"));
+    }
+
+    let (nonce, ciphertext) = crypto.encrypt(b"telegram_webhook_secret", secret.as_bytes())?;
+    db::upsert_secret(&state.pool, "telegram_webhook_secret", &nonce, &ciphertext).await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
+async fn admin_delete_telegram_webhook_secret(
+    State(state): State<AppState>,
+) -> AppResult<Redirect> {
+    db::delete_secret(&state.pool, "telegram_webhook_secret").await?;
+    Ok(Redirect::to("/admin/settings"))
+}
+
 fn normalize_optional_string(v: Option<String>) -> Option<String> {
     let Some(s) = v else { return None };
     let s = s.trim();
@@ -570,6 +812,132 @@ async fn admin_tasks(State(state): State<AppState>) -> AppResult<Html<String>> {
     Ok(Html(tpl.render()?))
 }
 
+async fn admin_memory_get(State(state): State<AppState>) -> AppResult<Html<String>> {
+    let sessions = db::list_sessions(&state.pool, 200).await?;
+    let tpl = MemoryTemplate {
+        active: "memory",
+        sessions: sessions.into_iter().map(Into::into).collect(),
+    };
+    Ok(Html(tpl.render()?))
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryClearForm {
+    conversation_key: String,
+}
+
+async fn admin_memory_clear(
+    State(state): State<AppState>,
+    Form(form): Form<MemoryClearForm>,
+) -> AppResult<Redirect> {
+    let key = form.conversation_key.trim();
+    if !key.is_empty() {
+        let _ = db::delete_session(&state.pool, key).await?;
+    }
+    Ok(Redirect::to("/admin/memory"))
+}
+
+async fn admin_context_get(State(state): State<AppState>) -> AppResult<Html<String>> {
+    let context_dir = state.config.data_dir.join("context");
+    let context_dir = tokio::fs::canonicalize(&context_dir)
+        .await
+        .unwrap_or(context_dir);
+
+    let files = list_context_files(&context_dir).await?;
+    let tpl = ContextTemplate {
+        active: "context",
+        files,
+    };
+    Ok(Html(tpl.render()?))
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextEditQuery {
+    path: Option<String>,
+}
+
+async fn admin_context_edit_get(
+    State(state): State<AppState>,
+    Query(q): Query<ContextEditQuery>,
+) -> AppResult<Html<String>> {
+    let path = q.path.unwrap_or_else(|| "INDEX.md".to_string());
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Ok(Html(
+            ContextEditTemplate {
+                active: "context",
+                path: "INDEX.md".to_string(),
+                content: String::new(),
+                bytes: "0".to_string(),
+            }
+            .render()?,
+        ));
+    }
+
+    let context_dir = state.config.data_dir.join("context");
+    let context_dir = tokio::fs::canonicalize(&context_dir)
+        .await
+        .unwrap_or(context_dir);
+    let rel = sanitize_rel_path(&path)?;
+    let full = resolve_under_root_no_symlinks(&context_dir, &rel).await?;
+
+    let content = match tokio::fs::read_to_string(&full).await {
+        Ok(v) => v,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(anyhow::Error::new(err).context("read context file").into()),
+    };
+
+    let bytes = content.as_bytes().len().to_string();
+    let tpl = ContextEditTemplate {
+        active: "context",
+        path,
+        content,
+        bytes,
+    };
+    Ok(Html(tpl.render()?))
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextEditForm {
+    path: String,
+    content: String,
+}
+
+async fn admin_context_edit_post(
+    State(state): State<AppState>,
+    Form(form): Form<ContextEditForm>,
+) -> AppResult<Redirect> {
+    const MAX_CHARS: usize = 300_000;
+
+    let path = form.path.trim().to_string();
+    if path.is_empty() {
+        return Ok(Redirect::to("/admin/context"));
+    }
+
+    let context_dir = state.config.data_dir.join("context");
+    let context_dir = tokio::fs::canonicalize(&context_dir)
+        .await
+        .unwrap_or(context_dir);
+    let rel = sanitize_rel_path(&path)?;
+    let full = resolve_under_root_no_symlinks(&context_dir, &rel).await?;
+
+    if let Some(parent) = full.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("create context file parent dir")?;
+    }
+
+    let content = clamp_chars(form.content, MAX_CHARS);
+    tokio::fs::write(&full, content.as_bytes())
+        .await
+        .context("write context file")?;
+
+    Ok(Redirect::to(&format!(
+        "/admin/context/edit?path={}",
+        urlencoding::encode(&path)
+    )))
+}
+
 async fn admin_task_cancel(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -584,6 +952,251 @@ async fn admin_task_retry(
 ) -> AppResult<Redirect> {
     let _ = db::retry_task(&state.pool, id).await?;
     Ok(Redirect::to("/admin/tasks"))
+}
+
+async fn admin_cron_get(State(state): State<AppState>) -> AppResult<Html<String>> {
+    let settings = db::get_settings(&state.pool).await?;
+    let jobs = db::list_cron_jobs(&state.pool, 100).await?;
+    let tpl = CronTemplate {
+        active: "cron",
+        cron_enabled: settings.allow_cron,
+        workspace_id: settings.workspace_id.unwrap_or_default(),
+        jobs: jobs.into_iter().map(Into::into).collect(),
+    };
+    Ok(Html(tpl.render()?))
+}
+
+#[derive(Debug, Deserialize)]
+struct CronAddForm {
+    name: String,
+    channel_id: String,
+    thread_ts: Option<String>,
+    prompt_text: String,
+
+    mode: Option<String>, // agent | message
+
+    schedule_kind: String, // every | cron | at
+    every_seconds: Option<i64>,
+    cron_expr: Option<String>,
+    at_ts: Option<i64>,
+
+    enabled: Option<String>,
+}
+
+async fn admin_cron_add(
+    State(state): State<AppState>,
+    Form(form): Form<CronAddForm>,
+) -> AppResult<Redirect> {
+    let settings = db::get_settings(&state.pool).await?;
+    let Some(workspace_id) = settings
+        .workspace_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(anyhow::anyhow!(
+            "workspace_id is not set yet. Mention Grail once in Slack so it can pin the workspace id."
+        )
+        .into());
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let mut job = crate::models::CronJob {
+        id: random_id("cron"),
+        name: form.name.trim().to_string(),
+        enabled: form.enabled.is_some(),
+        mode: form
+            .mode
+            .unwrap_or_else(|| "agent".to_string())
+            .trim()
+            .to_string(),
+        schedule_kind: form.schedule_kind.trim().to_string(),
+        every_seconds: form.every_seconds,
+        cron_expr: form
+            .cron_expr
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        at_ts: form.at_ts,
+        workspace_id,
+        channel_id: form.channel_id.trim().to_string(),
+        thread_ts: form.thread_ts.unwrap_or_default().trim().to_string(), // empty = post in channel (no thread)
+        prompt_text: clamp_chars(form.prompt_text.trim().to_string(), 8_000),
+        next_run_at: None,
+        last_run_at: None,
+        last_status: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    // Basic validation + compute initial next_run_at.
+    if job.name.is_empty() {
+        return Err(anyhow::anyhow!("name is required").into());
+    }
+    if job.channel_id.is_empty() {
+        return Err(anyhow::anyhow!("channel_id is required").into());
+    }
+    if job.prompt_text.trim().is_empty() {
+        return Err(anyhow::anyhow!("prompt_text is required").into());
+    }
+
+    job.next_run_at = match job.schedule_kind.as_str() {
+        "every" => {
+            let s = job.every_seconds.context("every_seconds is required")?;
+            if s < 1 {
+                return Err(anyhow::anyhow!("every_seconds must be >= 1").into());
+            }
+            Some(now + s)
+        }
+        "cron" => {
+            let expr = job.cron_expr.as_deref().context("cron_expr is required")?;
+            let normalized = crate::cron_expr::normalize_cron_expr(expr)?;
+            // Store normalized so execution is predictable.
+            job.cron_expr = Some(normalized.clone());
+            let schedule = cron::Schedule::from_str(&normalized).context("parse cron expr")?;
+            let next = schedule
+                .upcoming(chrono::Utc)
+                .next()
+                .context("cron had no upcoming times")?;
+            Some(next.timestamp())
+        }
+        "at" => {
+            let at = job.at_ts.context("at_ts is required")?;
+            if at <= now {
+                return Err(anyhow::anyhow!("at_ts must be in the future (unix seconds)").into());
+            }
+            Some(at)
+        }
+        other => {
+            return Err(anyhow::anyhow!("unknown schedule_kind: {other}").into());
+        }
+    };
+
+    db::insert_cron_job(&state.pool, &job).await?;
+    Ok(Redirect::to("/admin/cron"))
+}
+
+async fn admin_cron_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = db::delete_cron_job(&state.pool, &id).await?;
+    Ok(Redirect::to("/admin/cron"))
+}
+
+async fn admin_cron_enable(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = db::set_cron_job_enabled(&state.pool, &id, true).await?;
+    Ok(Redirect::to("/admin/cron"))
+}
+
+async fn admin_cron_disable(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = db::set_cron_job_enabled(&state.pool, &id, false).await?;
+    Ok(Redirect::to("/admin/cron"))
+}
+
+async fn admin_guardrails_get(State(state): State<AppState>) -> AppResult<Html<String>> {
+    let rules = db::list_guardrail_rules(&state.pool, None, 500).await?;
+    let tpl = GuardrailsTemplate {
+        active: "guardrails",
+        rules: rules.into_iter().map(Into::into).collect(),
+    };
+    Ok(Html(tpl.render()?))
+}
+
+#[derive(Debug, Deserialize)]
+struct GuardrailAddForm {
+    name: String,
+    kind: String,
+    action: String,
+    pattern_kind: String,
+    pattern: String,
+    priority: i64,
+    enabled: Option<String>,
+}
+
+async fn admin_guardrails_add(
+    State(state): State<AppState>,
+    Form(form): Form<GuardrailAddForm>,
+) -> AppResult<Redirect> {
+    let now = chrono::Utc::now().timestamp();
+    let rule = crate::models::GuardrailRule {
+        id: random_id("gr"),
+        name: clamp_chars(form.name.trim().to_string(), 120),
+        kind: form.kind.trim().to_string(),
+        pattern_kind: form.pattern_kind.trim().to_string(),
+        pattern: clamp_chars(form.pattern.trim().to_string(), 2_000),
+        action: form.action.trim().to_string(),
+        priority: form.priority.clamp(-10_000, 10_000),
+        enabled: form.enabled.is_some(),
+        created_at: now,
+        updated_at: now,
+    };
+    crate::guardrails::validate_rule(&rule)?;
+    db::insert_guardrail_rule(&state.pool, &rule).await?;
+    Ok(Redirect::to("/admin/guardrails"))
+}
+
+async fn admin_guardrails_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = db::delete_guardrail_rule(&state.pool, &id).await?;
+    Ok(Redirect::to("/admin/guardrails"))
+}
+
+async fn admin_guardrails_enable(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = db::set_guardrail_rule_enabled(&state.pool, &id, true).await?;
+    Ok(Redirect::to("/admin/guardrails"))
+}
+
+async fn admin_guardrails_disable(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = db::set_guardrail_rule_enabled(&state.pool, &id, false).await?;
+    Ok(Redirect::to("/admin/guardrails"))
+}
+
+async fn admin_approvals_get(State(state): State<AppState>) -> AppResult<Html<String>> {
+    let approvals = db::list_recent_approvals(&state.pool, 100).await?;
+    let tpl = ApprovalsTemplate {
+        active: "approvals",
+        approvals: approvals.into_iter().map(Into::into).collect(),
+    };
+    Ok(Html(tpl.render()?))
+}
+
+async fn admin_approval_approve(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = crate::approvals::handle_approval_command(&state, "approve", &id).await?;
+    Ok(Redirect::to("/admin/approvals"))
+}
+
+async fn admin_approval_always(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = crate::approvals::handle_approval_command(&state, "always", &id).await?;
+    Ok(Redirect::to("/admin/approvals"))
+}
+
+async fn admin_approval_deny(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Redirect> {
+    let _ = crate::approvals::handle_approval_command(&state, "deny", &id).await?;
+    Ok(Redirect::to("/admin/approvals"))
 }
 
 async fn admin_auth_get(State(state): State<AppState>) -> AppResult<Html<String>> {
@@ -687,7 +1300,16 @@ async fn slack_events(
     let secret = match crate::secrets::load_slack_signing_secret_opt(&state).await {
         Ok(Some(v)) => v,
         Ok(None) => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "slack not configured").into_response()
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "slack not configured (missing SLACK_SIGNING_SECRET)",
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-slack-no-retry"),
+                HeaderValue::from_static("1"),
+            );
+            return resp;
         }
         Err(err) => {
             warn!(error = %err, "failed to load slack signing secret");
@@ -710,23 +1332,111 @@ async fn slack_events(
 
     match env {
         SlackEnvelope::UrlVerification { challenge } => {
-            return axum::Json(serde_json::json!({ "challenge": challenge })).into_response();
+            axum::Json(serde_json::json!({ "challenge": challenge })).into_response()
         }
         SlackEnvelope::EventCallback {
             team_id,
             event_id,
             event,
         } => {
-            let SlackEvent::AppMention {
-                user,
-                text,
-                ts,
-                channel,
-                thread_ts,
-            } = event
-            else {
-                return (StatusCode::OK, "").into_response();
+            let (user, text, ts, channel, thread_ts, is_dm) = match event {
+                SlackEvent::AppMention {
+                    user,
+                    text,
+                    ts,
+                    channel,
+                    thread_ts,
+                } => {
+                    let thread_ts = thread_ts.unwrap_or_else(|| ts.clone());
+                    (user, text, ts, channel, thread_ts, false)
+                }
+                SlackEvent::Message {
+                    user,
+                    text,
+                    ts,
+                    channel,
+                    channel_type,
+                    subtype,
+                    bot_id,
+                    ..
+                } => {
+                    // Only handle direct messages (IMs). Channel mentions should use app_mention.
+                    if channel_type.as_deref().unwrap_or("") != "im" {
+                        return (StatusCode::OK, "").into_response();
+                    }
+                    // Ignore bot messages and non-user subtypes to avoid loops.
+                    if bot_id.is_some() || subtype.is_some() {
+                        return (StatusCode::OK, "").into_response();
+                    }
+                    let Some(user) = user else {
+                        return (StatusCode::OK, "").into_response();
+                    };
+                    let Some(text) = text else {
+                        return (StatusCode::OK, "").into_response();
+                    };
+                    // In DMs, reply in-channel (no thread).
+                    (user, text, ts, channel, String::new(), true)
+                }
+                _ => return (StatusCode::OK, "").into_response(),
             };
+
+            // Enforce single-workspace per deployment.
+            match db::get_settings(&state.pool).await {
+                Ok(settings) => {
+                    if let Some(want) = settings
+                        .workspace_id
+                        .as_deref()
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                    {
+                        if want != team_id {
+                            warn!(want, got = %team_id, "ignoring slack event from unexpected workspace");
+                            return (StatusCode::OK, "").into_response();
+                        }
+                    } else {
+                        // Best-effort: pin to the first workspace we see.
+                        let _ = db::set_workspace_id_if_missing(&state.pool, &team_id).await;
+                    }
+
+                    // Optional allow-list (nanobot-style allowFrom).
+                    let allowed = parse_allow_from(&settings.slack_allow_from);
+                    if !allowed.is_empty() && !allowed.contains(user.as_str()) {
+                        warn!(user = %user, "slack user not in allow list; ignoring");
+                        if let Ok(Some(token)) =
+                            crate::secrets::load_slack_bot_token_opt(&state).await
+                        {
+                            let slack = SlackClient::new(state.http.clone(), token);
+                            let msg = "Sorry, you're not authorized to use this Grail instance.";
+                            let _ = slack
+                                .post_message(&channel, thread_opt(&thread_ts), msg)
+                                .await;
+                        }
+                        return (StatusCode::OK, "").into_response();
+                    }
+
+                    // Optional channel allow-list (DMs always allowed).
+                    if !is_dm {
+                        let channels = parse_allow_from(&settings.slack_allow_channels);
+                        if !channels.is_empty() && !channels.contains(channel.as_str()) {
+                            warn!(channel = %channel, "slack channel not in allow list; ignoring");
+                            if let Ok(Some(token)) =
+                                crate::secrets::load_slack_bot_token_opt(&state).await
+                            {
+                                let slack = SlackClient::new(state.http.clone(), token);
+                                let msg =
+                                    "Sorry, this Grail instance isn't enabled in this channel.";
+                                let _ = slack
+                                    .post_message(&channel, thread_opt(&thread_ts), msg)
+                                    .await;
+                            }
+                            return (StatusCode::OK, "").into_response();
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to load settings for slack authz; allowing event");
+                }
+            }
 
             let processed =
                 match db::try_mark_event_processed(&state.pool, &team_id, &event_id).await {
@@ -741,11 +1451,36 @@ async fn slack_events(
                 return (StatusCode::OK, "").into_response();
             }
 
-            let thread_ts = thread_ts.unwrap_or_else(|| ts.clone());
-            let prompt = clamp_chars(strip_leading_mentions(&text), 4_000);
+            let prompt = if is_dm {
+                clamp_chars(text.trim().to_string(), 4_000)
+            } else {
+                clamp_chars(strip_leading_mentions(&text), 4_000)
+            };
+
+            if let Some((action, approval_id)) = parse_approval_command(&prompt) {
+                match crate::approvals::handle_approval_command(&state, action, &approval_id).await
+                {
+                    Ok(Some(msg)) => {
+                        if let Ok(Some(token)) =
+                            crate::secrets::load_slack_bot_token_opt(&state).await
+                        {
+                            let slack = SlackClient::new(state.http.clone(), token);
+                            let _ = slack
+                                .post_message(&channel, thread_opt(&thread_ts), msg.trim())
+                                .await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = %err, "failed to handle approval command");
+                    }
+                }
+                return (StatusCode::OK, "").into_response();
+            }
 
             let task_id = match db::enqueue_task(
                 &state.pool,
+                "slack",
                 &team_id,
                 &channel,
                 &thread_ts,
@@ -767,9 +1502,11 @@ async fn slack_events(
                 Ok(Some(token)) => {
                     let slack = SlackClient::new(state.http.clone(), token);
                     let queued_text = format!("Queued as #{task_id}. I'll start soon.");
+                    let thread_ts = thread_ts.clone();
                     tokio::spawn(async move {
-                        if let Err(err) =
-                            slack.post_message(&channel, &thread_ts, &queued_text).await
+                        if let Err(err) = slack
+                            .post_message(&channel, thread_opt(&thread_ts), &queued_text)
+                            .await
                         {
                             warn!(error = %err, "failed to post queued message");
                         }
@@ -783,6 +1520,479 @@ async fn slack_events(
 
             (StatusCode::OK, "").into_response()
         }
+    }
+}
+
+async fn slack_actions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let secret = match crate::secrets::load_slack_signing_secret_opt(&state).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "slack not configured (missing SLACK_SIGNING_SECRET)",
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-slack-no-retry"),
+                HeaderValue::from_static("1"),
+            );
+            return resp;
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to load slack signing secret");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    if let Err(err) = verify_slack_signature(&secret, &headers, &body) {
+        warn!(error = %err, "invalid slack signature (actions)");
+        return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SlackActionUser {
+        id: String,
+    }
+    #[derive(Debug, Deserialize)]
+    struct SlackActionTeam {
+        id: String,
+    }
+    #[derive(Debug, Deserialize)]
+    struct SlackActionChannel {
+        id: String,
+    }
+    #[derive(Debug, Deserialize)]
+    struct SlackActionMessage {
+        ts: String,
+        #[serde(default)]
+        thread_ts: Option<String>,
+    }
+    #[derive(Debug, Deserialize)]
+    struct SlackAction {
+        action_id: String,
+        #[serde(default)]
+        value: Option<String>,
+    }
+    #[derive(Debug, Deserialize)]
+    struct SlackActionPayload {
+        #[serde(rename = "type")]
+        kind: String,
+        user: SlackActionUser,
+        #[serde(default)]
+        team: Option<SlackActionTeam>,
+        channel: SlackActionChannel,
+        message: SlackActionMessage,
+        actions: Vec<SlackAction>,
+    }
+
+    let form = parse_urlencoded_form(&body);
+    let Some(payload_raw) = form.get("payload").map(|s| s.as_str()) else {
+        return (StatusCode::BAD_REQUEST, "missing payload").into_response();
+    };
+
+    let payload: SlackActionPayload = match serde_json::from_str(payload_raw) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, "invalid slack actions payload json");
+            return (StatusCode::BAD_REQUEST, "invalid payload").into_response();
+        }
+    };
+
+    if payload.kind != "block_actions" {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    // Enforce single-workspace per deployment (best-effort).
+    if let Ok(settings) = db::get_settings(&state.pool).await {
+        if let (Some(want), Some(team)) = (
+            settings
+                .workspace_id
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()),
+            payload.team.as_ref().map(|t| t.id.as_str()),
+        ) {
+            if want != team {
+                warn!(
+                    want,
+                    got = team,
+                    "ignoring slack action from unexpected workspace"
+                );
+                return (StatusCode::OK, "").into_response();
+            }
+        }
+
+        // Optional allow-list.
+        let allowed = parse_allow_from(&settings.slack_allow_from);
+        if !allowed.is_empty() && !allowed.contains(payload.user.id.as_str()) {
+            warn!(user = %payload.user.id, "slack user not in allow list; ignoring action");
+            return (StatusCode::OK, "").into_response();
+        }
+
+        // Optional channel allow-list (DMs always allowed).
+        let channels = parse_allow_from(&settings.slack_allow_channels);
+        if !channels.is_empty()
+            && !payload.channel.id.starts_with('D')
+            && !channels.contains(payload.channel.id.as_str())
+        {
+            warn!(
+                channel = %payload.channel.id,
+                "slack channel not in allow list; ignoring action"
+            );
+            return (StatusCode::OK, "").into_response();
+        }
+    }
+
+    let Some(action) = payload.actions.get(0) else {
+        return (StatusCode::OK, "").into_response();
+    };
+    let approval_id = action.value.clone().unwrap_or_default();
+    if approval_id.trim().is_empty() {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    let action_str = match action.action_id.as_str() {
+        "grail_approve" => "approve",
+        "grail_always" => "always",
+        "grail_deny" => "deny",
+        other => {
+            warn!(action_id = other, "unknown slack action_id");
+            return (StatusCode::OK, "").into_response();
+        }
+    };
+
+    let msg =
+        match crate::approvals::handle_approval_command(&state, action_str, &approval_id).await {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, "failed to handle approval via slack actions");
+                None
+            }
+        };
+
+    if let Some(text) = msg {
+        if let Ok(Some(token)) = crate::secrets::load_slack_bot_token_opt(&state).await {
+            let slack = SlackClient::new(state.http.clone(), token);
+            let thread_ts = payload
+                .message
+                .thread_ts
+                .clone()
+                .unwrap_or_else(|| payload.message.ts.clone());
+            let _ = slack
+                .post_message(&payload.channel.id, thread_opt(&thread_ts), text.trim())
+                .await;
+        }
+    }
+
+    (StatusCode::OK, "").into_response()
+}
+
+async fn telegram_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    // If Telegram is disabled, ack to avoid retries.
+    let settings = match db::get_settings(&state.pool).await {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(error = %err, "failed to load settings for telegram webhook");
+            return (StatusCode::OK, "").into_response();
+        }
+    };
+    if !settings.allow_telegram {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    // Production default: require Telegram webhook secret verification when Telegram is enabled.
+    let want = match crate::secrets::load_telegram_webhook_secret_opt(&state).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "telegram not configured (missing TELEGRAM_WEBHOOK_SECRET)",
+            )
+                .into_response();
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to load telegram webhook secret");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+    let got = headers
+        .get("X-Telegram-Bot-Api-Secret-Token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if got != want {
+        warn!("invalid telegram webhook secret token");
+        return (StatusCode::UNAUTHORIZED, "invalid secret").into_response();
+    }
+
+    let update: crate::telegram::TelegramUpdate = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, "invalid telegram payload");
+            return (StatusCode::BAD_REQUEST, "invalid payload").into_response();
+        }
+    };
+
+    let Some(msg) = update.message.clone().or(update.edited_message.clone()) else {
+        return (StatusCode::OK, "").into_response();
+    };
+    let Some(text) = msg.text.clone() else {
+        return (StatusCode::OK, "").into_response();
+    };
+    let from_user_id = msg
+        .from
+        .as_ref()
+        .map(|u| u.id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Nanobot-style allowFrom (Telegram user IDs).
+    let allowed = parse_allow_from(&settings.telegram_allow_from);
+    if !allowed.is_empty() && !allowed.contains(from_user_id.as_str()) {
+        warn!(user_id = %from_user_id, "telegram user not in allow list; ignoring");
+        return (StatusCode::OK, "").into_response();
+    }
+
+    // Dedupe (Telegram retries webhooks).
+    let processed =
+        match db::try_mark_event_processed(&state.pool, "telegram", &update.update_id.to_string())
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                error!(error = %err, "failed to dedupe telegram update");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+            }
+        };
+    if !processed {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    // Persist minimal local history for context injection.
+    let stored = crate::models::TelegramMessage {
+        chat_id: msg.chat.id.to_string(),
+        message_id: msg.message_id,
+        from_user_id: Some(from_user_id.clone()),
+        is_bot: msg.from.as_ref().map(|u| u.is_bot).unwrap_or(false),
+        text: Some(clamp_chars(text.clone(), 8_000)),
+        ts: msg.date,
+    };
+    if let Err(err) = db::insert_telegram_message(&state.pool, &stored).await {
+        warn!(error = %err, "failed to store telegram message");
+    }
+
+    let token = match crate::secrets::load_telegram_bot_token_opt(&state).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "telegram not configured (missing TELEGRAM_BOT_TOKEN)",
+            )
+                .into_response();
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to load telegram bot token");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let bot_username = match telegram_bot_username_cached(&state, &token).await {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, "failed to resolve telegram bot username");
+            None
+        }
+    };
+
+    let cleaned = clean_telegram_prompt(&text, bot_username.as_deref());
+
+    // Handle approval commands even if the bot isn't explicitly mentioned.
+    if let Some((action, approval_id)) = parse_approval_command(&cleaned) {
+        if let Ok(Some(a)) = db::get_approval(&state.pool, &approval_id).await {
+            if a.status == "pending" {
+                if let Ok(Some(msg_text)) =
+                    crate::approvals::handle_approval_command(&state, action, &approval_id).await
+                {
+                    let tg = crate::telegram::TelegramClient::new(state.http.clone(), token);
+                    let _ = tg
+                        .send_message(&stored.chat_id, Some(msg.message_id), msg_text.trim())
+                        .await;
+                }
+                return (StatusCode::OK, "").into_response();
+            }
+        }
+    }
+
+    // Determine whether the message is directed at the bot.
+    let directed = if msg.chat.kind == "private" {
+        true
+    } else if msg
+        .reply_to_message
+        .as_ref()
+        .and_then(|m| m.from.as_ref())
+        .map(|u| u.is_bot)
+        .unwrap_or(false)
+    {
+        true
+    } else if let Some(user) = bot_username.as_deref() {
+        text.contains(&format!("@{user}"))
+            || text.starts_with("/grail")
+            || text.starts_with(&format!("/grail@{user}"))
+    } else {
+        text.starts_with("/grail")
+    };
+
+    if !directed {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    let prompt = clamp_chars(cleaned, 4_000);
+    if prompt.is_empty() {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    let task_id = match db::enqueue_task(
+        &state.pool,
+        "telegram",
+        "telegram",
+        &stored.chat_id,
+        &msg.message_id.to_string(),
+        &msg.message_id.to_string(),
+        &from_user_id,
+        &prompt,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(err) => {
+            error!(error = %err, "failed to enqueue telegram task");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        }
+    };
+
+    let tg = crate::telegram::TelegramClient::new(state.http.clone(), token);
+    let chat_id = stored.chat_id.clone();
+    let reply_to = msg.message_id;
+    tokio::spawn(async move {
+        let queued_text = format!("Queued as #{task_id}. I'll start soon.");
+        let _ = tg
+            .send_message(&chat_id, Some(reply_to), queued_text.trim())
+            .await;
+    });
+
+    (StatusCode::OK, "").into_response()
+}
+
+async fn telegram_bot_username_cached(
+    state: &AppState,
+    bot_token: &str,
+) -> anyhow::Result<Option<String>> {
+    {
+        let guard = state.telegram_bot_username.read().await;
+        if let Some(v) = guard.clone() {
+            return Ok(Some(v));
+        }
+    }
+
+    let tg = crate::telegram::TelegramClient::new(state.http.clone(), bot_token.to_string());
+    let me = tg.get_me().await?;
+    let Some(username) = me.username.clone().filter(|u| !u.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    let mut guard = state.telegram_bot_username.write().await;
+    *guard = Some(username.clone());
+    Ok(Some(username))
+}
+
+fn clean_telegram_prompt(text: &str, bot_username: Option<&str>) -> String {
+    let mut t = text.trim().to_string();
+
+    if t.starts_with('/') {
+        let mut parts = t.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        let first = first.trim();
+        if first.starts_with("/grail") || first.starts_with("/start") {
+            t = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+        }
+    }
+
+    if let Some(u) = bot_username {
+        let needle = format!("@{u}");
+        t = t.replace(&needle, "");
+    }
+
+    t.trim().to_string()
+}
+
+fn parse_allow_from(input: &str) -> std::collections::HashSet<String> {
+    input
+        .split(|c: char| c == ',' || c == '\n' || c == '\r' || c == '\t' || c == ' ')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn parse_urlencoded_form(body: &Bytes) -> HashMap<String, String> {
+    fn decode(s: &str) -> String {
+        // application/x-www-form-urlencoded uses '+' for space.
+        let s = s.replace('+', " ");
+        match urlencoding::decode(&s) {
+            Ok(v) => v.into_owned(),
+            Err(_) => s,
+        }
+    }
+
+    let raw = std::str::from_utf8(body).unwrap_or("");
+    let mut out: HashMap<String, String> = HashMap::new();
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut it = pair.splitn(2, '=');
+        let k = it.next().unwrap_or("");
+        let v = it.next().unwrap_or("");
+        if k.is_empty() {
+            continue;
+        }
+        out.insert(decode(k), decode(v));
+    }
+    out
+}
+
+fn parse_approval_command(text: &str) -> Option<(&'static str, String)> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mut parts = t.split_whitespace();
+    let cmd = parts.next()?.to_ascii_lowercase();
+    let id = parts.next()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    match cmd.as_str() {
+        "approve" => Some(("approve", id.to_string())),
+        "always" => Some(("always", id.to_string())),
+        "deny" => Some(("deny", id.to_string())),
+        "cancel" => Some(("cancel", id.to_string())),
+        _ => None,
+    }
+}
+
+fn thread_opt(thread_ts: &str) -> Option<&str> {
+    let t = thread_ts.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
     }
 }
 
@@ -913,6 +2123,108 @@ fn clamp_chars(s: String, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+async fn list_context_files(
+    root: &std::path::Path,
+) -> anyhow::Result<Vec<crate::templates::ContextFileRow>> {
+    let mut out: Vec<crate::templates::ContextFileRow> = Vec::new();
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut rd = tokio::fs::read_dir(&dir)
+            .await
+            .with_context(|| format!("read_dir {}", dir.display()))?;
+        while let Some(ent) = rd.next_entry().await? {
+            let path = ent.path();
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+
+            let meta = ent.metadata().await?;
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let edit_url = format!("/admin/context/edit?path={}", urlencoding::encode(&rel));
+            out.push(crate::templates::ContextFileRow {
+                path: rel,
+                bytes: format!("{}", meta.len()),
+                edit_url,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn sanitize_rel_path(path: &str) -> anyhow::Result<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(path.trim());
+    anyhow::ensure!(!p.as_os_str().is_empty(), "empty path");
+    anyhow::ensure!(!p.is_absolute(), "absolute paths are not allowed");
+    for c in p.components() {
+        match c {
+            std::path::Component::Normal(_) => {}
+            _ => anyhow::bail!("invalid path component in {}", path),
+        }
+    }
+    Ok(p)
+}
+
+async fn resolve_under_root_no_symlinks(
+    root: &std::path::Path,
+    rel: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .unwrap_or_else(|_| root.to_path_buf());
+
+    let mut cur = root.clone();
+    for comp in rel.components() {
+        let std::path::Component::Normal(seg) = comp else {
+            anyhow::bail!("invalid path component");
+        };
+        cur.push(seg);
+
+        match tokio::fs::symlink_metadata(&cur).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!("symlinks are not allowed in context paths");
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(anyhow::Error::new(err).context("symlink_metadata")),
+        }
+    }
+
+    // If the path exists, ensure it canonicalizes under root (defense in depth).
+    if tokio::fs::metadata(&cur).await.is_ok() {
+        let canon = tokio::fs::canonicalize(&cur).await?;
+        anyhow::ensure!(canon.starts_with(&root), "context path escapes root");
+        return Ok(canon);
+    }
+
+    // For new files, check the parent directory is under root.
+    if let Some(parent) = cur.parent() {
+        let parent_canon = tokio::fs::canonicalize(parent)
+            .await
+            .unwrap_or_else(|_| parent.to_path_buf());
+        anyhow::ensure!(parent_canon.starts_with(&root), "context path escapes root");
+    }
+
+    Ok(cur)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum SlackEnvelope {
@@ -940,6 +2252,24 @@ enum SlackEvent {
         channel: String,
         #[serde(default)]
         thread_ts: Option<String>,
+    },
+
+    #[serde(rename = "message")]
+    Message {
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+        ts: String,
+        channel: String,
+        #[serde(default)]
+        thread_ts: Option<String>,
+        #[serde(default)]
+        channel_type: Option<String>, // im | channel | group | mpim
+        #[serde(default)]
+        subtype: Option<String>,
+        #[serde(default)]
+        bot_id: Option<String>,
     },
 
     #[serde(other)]

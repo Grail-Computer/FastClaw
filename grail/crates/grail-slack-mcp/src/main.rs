@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -27,6 +28,7 @@ fn stdio() -> (tokio::io::Stdin, tokio::io::Stdout) {
 struct SlackMcpServer {
     tools: Arc<Vec<Tool>>,
     http: reqwest::Client,
+    allowed_channels: Arc<HashSet<String>>,
 }
 
 impl SlackMcpServer {
@@ -37,11 +39,15 @@ impl SlackMcpServer {
             Self::tool_get_permalink()?,
             Self::tool_get_user()?,
             Self::tool_list_channels()?,
+            Self::tool_search_messages()?,
         ];
+
+        let allowed_channels = parse_allowlist_env("GRAIL_SLACK_ALLOW_CHANNELS");
 
         Ok(Self {
             tools: Arc::new(tools),
             http: reqwest::Client::new(),
+            allowed_channels: Arc::new(allowed_channels),
         })
     }
 
@@ -140,10 +146,40 @@ impl SlackMcpServer {
         ))
     }
 
+    fn tool_search_messages() -> anyhow::Result<Tool> {
+        let schema: JsonObject = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Slack search query. Tip: use `in:<channel_id>` to restrict." },
+                "count": { "type": "integer", "minimum": 1, "maximum": 20, "default": 10 }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }))
+        .context("deserialize search_messages schema")?;
+
+        Ok(Tool::new(
+            Cow::Borrowed("search_messages"),
+            Cow::Borrowed("Search Slack messages (requires Slack scope search:read)."),
+            Arc::new(schema),
+        ))
+    }
+
     fn slack_token() -> Result<String, McpError> {
         std::env::var("SLACK_BOT_TOKEN").map_err(|_| {
             McpError::invalid_params("missing SLACK_BOT_TOKEN env var", Some(json!({})))
         })
+    }
+
+    fn channel_allowed(&self, channel: &str) -> bool {
+        // Mirror server-side behavior: DMs are always allowed.
+        if channel.starts_with('D') {
+            return true;
+        }
+        if self.allowed_channels.is_empty() {
+            return true;
+        }
+        self.allowed_channels.contains(channel)
     }
 
     async fn slack_api_get<T: for<'de> Deserialize<'de>>(
@@ -256,6 +292,13 @@ struct ArgsListChannels {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct ArgsSearchMessages {
+    query: String,
+    #[serde(default)]
+    count: Option<i64>,
+}
+
 impl ServerHandler for SlackMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -290,6 +333,12 @@ impl ServerHandler for SlackMcpServer {
         match request.name.as_ref() {
             "get_channel_history" => {
                 let args = parse_args::<ArgsGetChannelHistory>(&request, "get_channel_history")?;
+                if !self.channel_allowed(args.channel.as_str()) {
+                    return Err(McpError::invalid_params(
+                        "channel not allowed by GRAIL_SLACK_ALLOW_CHANNELS",
+                        Some(json!({ "channel": args.channel })),
+                    ));
+                }
                 let limit = args.limit.unwrap_or(20).clamp(1, 200);
                 let mut query = vec![
                     ("channel", args.channel.clone()),
@@ -315,6 +364,12 @@ impl ServerHandler for SlackMcpServer {
             }
             "get_thread" => {
                 let args = parse_args::<ArgsGetThread>(&request, "get_thread")?;
+                if !self.channel_allowed(args.channel.as_str()) {
+                    return Err(McpError::invalid_params(
+                        "channel not allowed by GRAIL_SLACK_ALLOW_CHANNELS",
+                        Some(json!({ "channel": args.channel })),
+                    ));
+                }
                 let limit = args.limit.unwrap_or(50).clamp(1, 200);
                 let mut query = vec![
                     ("channel", args.channel.clone()),
@@ -342,6 +397,12 @@ impl ServerHandler for SlackMcpServer {
             }
             "get_permalink" => {
                 let args = parse_args::<ArgsGetPermalink>(&request, "get_permalink")?;
+                if !self.channel_allowed(args.channel.as_str()) {
+                    return Err(McpError::invalid_params(
+                        "channel not allowed by GRAIL_SLACK_ALLOW_CHANNELS",
+                        Some(json!({ "channel": args.channel })),
+                    ));
+                }
                 let query = vec![
                     ("channel", args.channel.clone()),
                     ("message_ts", args.message_ts.clone()),
@@ -388,10 +449,72 @@ impl ServerHandler for SlackMcpServer {
                 let SlackOkWrapper { inner, .. }: SlackOkWrapper<ListChannelsResponse> = self
                     .slack_api_get("https://slack.com/api/conversations.list", &query)
                     .await?;
+                let mut channels = inner.channels;
+                if !self.allowed_channels.is_empty() {
+                    channels.retain(|c| {
+                        c.get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|id| self.allowed_channels.contains(id))
+                            .unwrap_or(false)
+                    });
+                }
                 Ok(CallToolResult {
                     content: Vec::new(),
                     structured_content: Some(json!({
-                        "channels": inner.channels,
+                        "channels": channels,
+                    })),
+                    is_error: Some(false),
+                    meta: None,
+                })
+            }
+            "search_messages" => {
+                let args = parse_args::<ArgsSearchMessages>(&request, "search_messages")?;
+                let q = args.query.trim();
+                if q.is_empty() {
+                    return Err(McpError::invalid_params("query is required", None));
+                }
+                let count = args.count.unwrap_or(10).clamp(1, 20);
+                let query = vec![
+                    ("query", q.to_string()),
+                    ("count", count.to_string()),
+                    ("sort", "timestamp".to_string()),
+                    ("sort_dir", "desc".to_string()),
+                ];
+
+                #[derive(Deserialize)]
+                struct SearchInner {
+                    matches: Vec<serde_json::Value>,
+                    #[allow(dead_code)]
+                    total: Option<i64>,
+                    #[allow(dead_code)]
+                    paging: Option<serde_json::Value>,
+                }
+                #[derive(Deserialize)]
+                struct SearchResp {
+                    messages: SearchInner,
+                }
+
+                let SlackOkWrapper { inner, .. }: SlackOkWrapper<SearchResp> = self
+                    .slack_api_get("https://slack.com/api/search.messages", &query)
+                    .await?;
+
+                let mut matches = inner.messages.matches;
+                if !self.allowed_channels.is_empty() {
+                    matches.retain(|m| {
+                        let ch = m
+                            .get("channel")
+                            .and_then(|c| c.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        self.channel_allowed(ch)
+                    });
+                }
+
+                Ok(CallToolResult {
+                    content: Vec::new(),
+                    structured_content: Some(json!({
+                        "query": q,
+                        "matches": matches,
                     })),
                     is_error: Some(false),
                     meta: None,
@@ -419,6 +542,15 @@ fn parse_args<T: for<'de> Deserialize<'de>>(
             None,
         )),
     }
+}
+
+fn parse_allowlist_env(key: &str) -> HashSet<String> {
+    let raw = std::env::var(key).unwrap_or_default();
+    raw.split(|c: char| c == ',' || c == '\n' || c == '\r' || c == '\t' || c == ' ')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[tokio::main]

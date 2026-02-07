@@ -33,6 +33,14 @@ pub struct Config {
     #[arg(long, env = "SLACK_BOT_TOKEN")]
     pub slack_bot_token: Option<String>,
 
+    #[arg(long, env = "TELEGRAM_BOT_TOKEN")]
+    pub telegram_bot_token: Option<String>,
+
+    /// If set, require incoming webhooks to include header:
+    /// `X-Telegram-Bot-Api-Secret-Token: <value>`.
+    #[arg(long, env = "TELEGRAM_WEBHOOK_SECRET")]
+    pub telegram_webhook_secret: Option<String>,
+
     /// Optional base URL used when rendering links in the dashboard.
     #[arg(long, env = "BASE_URL")]
     pub base_url: Option<String>,

@@ -14,3 +14,8 @@ data/
 
 # Local Codex clone (reference-only; do not commit into template repo)
 codex/
+
+# Reference repos cloned during development (do not commit)
+nanobot/
+coworker/
+guardrails/

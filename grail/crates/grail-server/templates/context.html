@@ -1,0 +1,27 @@
+{% extends "layout.html" %}
+{% block title %}Grail | Context{% endblock %}
+{% block content %}
+  <h2 style="margin:0 0 10px 0; font-weight:700;">Context</h2>
+  <p style="margin:0 0 12px 0; color: var(--muted);">
+    Files under <span class="pill">/data/context</span> are durable and visible to Grail. Edit carefully.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Path</th>
+        <th>Bytes</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for f in files %}
+        <tr>
+          <td>{{ f.path }}</td>
+          <td style="color: var(--muted);">{{ f.bytes }}</td>
+          <td><a href="{{ f.edit_url }}">Edit</a></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+

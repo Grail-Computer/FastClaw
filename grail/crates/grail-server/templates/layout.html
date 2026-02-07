@@ -139,7 +139,8 @@
       }
 
       input,
-      select {
+      select,
+      textarea {
         width: 100%;
         padding: 10px 12px;
         border-radius: 12px;
@@ -193,6 +194,11 @@
         <div class="nav">
           <a class='{% if active == "status" %}active{% endif %}' href="/admin/status">Status</a>
           <a class='{% if active == "settings" %}active{% endif %}' href="/admin/settings">Settings</a>
+          <a class='{% if active == "cron" %}active{% endif %}' href="/admin/cron">Cron</a>
+          <a class='{% if active == "guardrails" %}active{% endif %}' href="/admin/guardrails">Guardrails</a>
+          <a class='{% if active == "approvals" %}active{% endif %}' href="/admin/approvals">Approvals</a>
+          <a class='{% if active == "memory" %}active{% endif %}' href="/admin/memory">Memory</a>
+          <a class='{% if active == "context" %}active{% endif %}' href="/admin/context">Context</a>
           <a class='{% if active == "auth" %}active{% endif %}' href="/admin/auth">Auth</a>
           <a class='{% if active == "tasks" %}active{% endif %}' href="/admin/tasks">Queue</a>
         </div>

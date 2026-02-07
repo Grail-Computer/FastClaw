@@ -1,0 +1,53 @@
+{% extends "layout.html" %}
+{% block title %}Grail | Approvals{% endblock %}
+{% block content %}
+  <h2 style="margin:0 0 10px 0; font-weight:700;">Approvals</h2>
+
+  <p style="margin:0 0 12px 0; color: var(--muted);">
+    Pending approvals can also be handled in Slack by replying: <span class="pill">@Grail approve &lt;id&gt;</span>
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Status</th>
+        <th>Kind</th>
+        <th>Decision</th>
+        <th>Created</th>
+        <th>Details</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in approvals %}
+        <tr>
+          <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">{{ a.id }}</td>
+          <td style="color: var(--muted);">{{ a.status }}</td>
+          <td style="color: var(--muted);">{{ a.kind }}</td>
+          <td style="color: var(--muted);">{{ a.decision }}</td>
+          <td style="color: var(--muted);">{{ a.created_at }}</td>
+          <td style="max-width: 520px; color: var(--muted);">{{ a.details }}</td>
+          <td>
+            <form method="post" action="/admin/approvals/{{ a.id }}/approve">
+              <button type="submit" style="margin-top:0; padding:6px 10px; font-size:12px;">
+                Approve
+              </button>
+            </form>
+            <form method="post" action="/admin/approvals/{{ a.id }}/always">
+              <button type="submit" style="margin-top:8px; padding:6px 10px; font-size:12px;">
+                Always
+              </button>
+            </form>
+            <form method="post" action="/admin/approvals/{{ a.id }}/deny">
+              <button type="submit" style="margin-top:8px; padding:6px 10px; font-size:12px; border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
+                Deny
+              </button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+

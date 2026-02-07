@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY grail /app/grail
 
 WORKDIR /app/grail
-RUN cargo build --release -p grail-server -p grail-slack-mcp
+RUN cargo build --release -p grail-server -p grail-slack-mcp -p grail-web-mcp
 
 
 FROM debian:bookworm-slim AS runtime
@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/grail/target/release/grail-server /usr/local/bin/grail-server
 COPY --from=builder /app/grail/target/release/grail-slack-mcp /usr/local/bin/grail-slack-mcp
+COPY --from=builder /app/grail/target/release/grail-web-mcp /usr/local/bin/grail-web-mcp
 
 # Install Codex CLI (Linux x86_64 musl) from GitHub releases.
 ARG CODEX_VERSION=rust-v0.98.0

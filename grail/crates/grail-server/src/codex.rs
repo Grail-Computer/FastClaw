@@ -10,7 +10,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::models::{PermissionsMode, Settings};
+use crate::models::{PermissionsMode, Settings, Task};
 
 #[derive(Debug, Clone)]
 pub struct CodexTurnOutput {
@@ -48,7 +48,13 @@ impl CodexManager {
         &mut self,
         openai_api_key: Option<&str>,
         slack_bot_token: Option<&str>,
+        slack_allow_channels: Option<&str>,
+        brave_search_api_key: Option<&str>,
+        web_allow_domains: Option<&str>,
+        web_deny_domains: Option<&str>,
         allow_slack_mcp: bool,
+        allow_web_mcp: bool,
+        extra_mcp_config: Option<&str>,
     ) -> anyhow::Result<()> {
         let codex_home = self.config.effective_codex_home();
         tokio::fs::create_dir_all(&codex_home)
@@ -56,7 +62,14 @@ impl CodexManager {
             .with_context(|| format!("create CODEX_HOME dir {}", codex_home.display()))?;
 
         // Write a minimal config.toml for Codex (MCP server + no update checks).
-        let cfg = self.render_codex_config(allow_slack_mcp);
+        let mut cfg = self.render_codex_config(allow_slack_mcp, allow_web_mcp, extra_mcp_config);
+        if let Err(err) = toml::from_str::<toml::Value>(&cfg) {
+            warn!(
+                error = %err,
+                "invalid extra MCP config; ignoring extra_mcp_config"
+            );
+            cfg = self.render_codex_config(allow_slack_mcp, allow_web_mcp, None);
+        }
         let cfg_fp = sha256_hex(cfg.as_bytes());
         let config_changed = self.last_config_fingerprint.as_deref() != Some(&cfg_fp);
         if config_changed {
@@ -82,9 +95,13 @@ impl CodexManager {
         // Restart the app-server if the auth inputs changed.
         let env_fp = sha256_hex(
             format!(
-                "openai_api_key={};slack_bot_token={};codex_home={}",
+                "openai_api_key={};slack_bot_token={};slack_allow_channels={};brave_search_api_key={};web_allow_domains={};web_deny_domains={};codex_home={}",
                 openai_api_key.unwrap_or(""),
                 slack_bot_token.unwrap_or(""),
+                slack_allow_channels.unwrap_or(""),
+                brave_search_api_key.unwrap_or(""),
+                web_allow_domains.unwrap_or(""),
+                web_deny_domains.unwrap_or(""),
                 codex_home.display()
             )
             .as_bytes(),
@@ -114,6 +131,10 @@ impl CodexManager {
                 &codex_home,
                 openai_api_key,
                 slack_bot_token,
+                slack_allow_channels,
+                brave_search_api_key,
+                web_allow_domains,
+                web_deny_domains,
             )
             .await?;
             self.proc = Some(proc);
@@ -204,6 +225,8 @@ impl CodexManager {
 
     pub async fn run_turn(
         &mut self,
+        state: &crate::AppState,
+        task: &Task,
         thread_id: &str,
         settings: &Settings,
         cwd: &Path,
@@ -270,8 +293,11 @@ impl CodexManager {
 
                 match method {
                     "item/commandExecution/requestApproval" => {
-                        let decision = decide_command_approval(settings, &params, cwd);
-                        proc.respond(id, json!({ "decision": decision })).await?;
+                        let resp = crate::approvals::handle_command_execution_request(
+                            state, settings, cwd, task, &params,
+                        )
+                        .await?;
+                        proc.respond(id, resp).await?;
                     }
                     "item/fileChange/requestApproval" => {
                         // We intentionally disallow Codex-driven file edits; use context_writes in
@@ -434,7 +460,12 @@ impl CodexManager {
         })
     }
 
-    fn render_codex_config(&self, allow_slack_mcp: bool) -> String {
+    fn render_codex_config(
+        &self,
+        allow_slack_mcp: bool,
+        allow_web_mcp: bool,
+        extra_mcp_config: Option<&str>,
+    ) -> String {
         // Keep this minimal; we rely primarily on per-turn overrides.
         // Avoid placing secrets in this file.
         let mut out = String::new();
@@ -444,9 +475,27 @@ impl CodexManager {
             out.push_str("\n[mcp_servers.slack]\n");
             out.push_str("command = \"grail-slack-mcp\"\n");
             out.push_str("args = []\n");
-            out.push_str("env_vars = [\"SLACK_BOT_TOKEN\"]\n");
+            out.push_str("env_vars = [\"SLACK_BOT_TOKEN\", \"GRAIL_SLACK_ALLOW_CHANNELS\"]\n");
             out.push_str("startup_timeout_sec = 10\n");
             out.push_str("tool_timeout_sec = 30\n");
+        }
+
+        if allow_web_mcp {
+            out.push_str("\n[mcp_servers.web]\n");
+            out.push_str("command = \"grail-web-mcp\"\n");
+            out.push_str("args = []\n");
+            out.push_str("env_vars = [\"BRAVE_SEARCH_API_KEY\", \"GRAIL_WEB_ALLOW_DOMAINS\", \"GRAIL_WEB_DENY_DOMAINS\"]\n");
+            out.push_str("startup_timeout_sec = 10\n");
+            out.push_str("tool_timeout_sec = 45\n");
+        }
+
+        if let Some(extra) = extra_mcp_config {
+            let extra = extra.trim();
+            if !extra.is_empty() {
+                out.push_str("\n\n# Extra MCP config (from Settings.extra_mcp_config)\n");
+                out.push_str(extra);
+                out.push('\n');
+            }
         }
 
         out
@@ -458,6 +507,10 @@ async fn spawn_codex_app_server(
     codex_home: &Path,
     openai_api_key: Option<&str>,
     slack_bot_token: Option<&str>,
+    slack_allow_channels: Option<&str>,
+    brave_search_api_key: Option<&str>,
+    web_allow_domains: Option<&str>,
+    web_deny_domains: Option<&str>,
 ) -> anyhow::Result<CodexProc> {
     let mut cmd = Command::new(codex_bin);
     cmd.arg("app-server");
@@ -469,6 +522,18 @@ async fn spawn_codex_app_server(
     }
     if let Some(t) = slack_bot_token {
         cmd.env("SLACK_BOT_TOKEN", t);
+    }
+    if let Some(v) = slack_allow_channels {
+        cmd.env("GRAIL_SLACK_ALLOW_CHANNELS", v);
+    }
+    if let Some(k) = brave_search_api_key {
+        cmd.env("BRAVE_SEARCH_API_KEY", k);
+    }
+    if let Some(v) = web_allow_domains {
+        cmd.env("GRAIL_WEB_ALLOW_DOMAINS", v);
+    }
+    if let Some(v) = web_deny_domains {
+        cmd.env("GRAIL_WEB_DENY_DOMAINS", v);
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -630,55 +695,6 @@ fn is_server_request(msg: &serde_json::Value) -> bool {
         && msg.get("id").is_some()
         && msg.get("result").is_none()
         && msg.get("error").is_none()
-}
-
-fn decide_command_approval(
-    settings: &Settings,
-    params: &serde_json::Value,
-    cwd: &Path,
-) -> &'static str {
-    if settings.permissions_mode != PermissionsMode::Full {
-        return "decline";
-    }
-
-    // Require commands to run under our configured cwd (avoid touching app code).
-    // Be strict: reject any cwd that contains `..` to avoid path traversal via lexical paths.
-    let raw = params.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-    let mut cmd_cwd = if raw.trim().is_empty() {
-        cwd.to_path_buf()
-    } else {
-        PathBuf::from(raw.trim())
-    };
-    if !cmd_cwd.is_absolute() {
-        cmd_cwd = cwd.join(cmd_cwd);
-    }
-
-    let Some(cmd_cwd) = clean_path_no_parent(&cmd_cwd) else {
-        return "decline";
-    };
-
-    if !cmd_cwd.starts_with(cwd) {
-        return "decline";
-    }
-
-    // NOTE: We rely on sandboxPolicy.networkAccess for network gating.
-    "accept"
-}
-
-fn clean_path_no_parent(p: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::Prefix(pre) => out.push(pre.as_os_str()),
-            Component::RootDir => out.push(c.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => return None,
-            Component::Normal(seg) => out.push(seg),
-        }
-    }
-    Some(out)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

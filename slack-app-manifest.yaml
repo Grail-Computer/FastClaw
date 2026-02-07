@@ -1,7 +1,7 @@
 display_information:
   name: Grail
   description: Slack micro-employee (Codex-powered)
-  background_color: "#0b1020"
+  background_color: "#000000"
 
 features:
   bot_user:
@@ -14,13 +14,22 @@ oauth_config:
       - app_mentions:read
       - chat:write
       - channels:history
-      - groups:history
-      - im:history
-      - mpim:history
       - channels:read
+      - commands
+      - emoji:read
+      - files:read
+      - files:write
+      - groups:history
       - groups:read
+      - im:history
       - im:read
+      - mpim:history
       - mpim:read
+      - pins:read
+      - pins:write
+      - reactions:read
+      - reactions:write
+      - search:read
       - users:read
 
 settings:
@@ -28,9 +37,20 @@ settings:
     request_url: https://YOUR_SERVICE_DOMAIN/slack/events
     bot_events:
       - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+      - reaction_added
+      - reaction_removed
+      - member_joined_channel
+      - member_left_channel
+      - channel_rename
+      - pin_added
+      - pin_removed
   interactivity:
-    is_enabled: false
+    is_enabled: true
+    request_url: https://YOUR_SERVICE_DOMAIN/slack/actions
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: false
-

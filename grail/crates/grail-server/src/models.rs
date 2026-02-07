@@ -30,9 +30,26 @@ pub struct Settings {
     pub reasoning_effort: Option<String>,
     pub reasoning_summary: Option<String>,
     pub permissions_mode: PermissionsMode,
+    pub workspace_id: Option<String>,
+    pub slack_allow_from: String,
+    pub slack_allow_channels: String,
+    pub allow_telegram: bool,
+    pub telegram_allow_from: String,
     pub allow_slack_mcp: bool,
+    pub allow_web_mcp: bool,
+    /// Extra TOML appended to CODEX_HOME/config.toml (advanced).
+    /// This is intentionally free-form so users can add custom MCP servers.
+    pub extra_mcp_config: String,
     pub allow_context_writes: bool,
     pub shell_network_access: bool,
+    pub allow_cron: bool,
+    pub auto_apply_cron_jobs: bool,
+    pub agent_name: String,
+    pub role_description: String,
+    pub command_approval_mode: String,
+    pub auto_apply_guardrail_tighten: bool,
+    pub web_allow_domains: String,
+    pub web_deny_domains: String,
     pub updated_at: i64,
 }
 
@@ -40,6 +57,7 @@ pub struct Settings {
 pub struct Task {
     pub id: i64,
     pub status: String,
+    pub provider: String,
     pub workspace_id: String,
     pub channel_id: String,
     pub thread_ts: String,
@@ -72,4 +90,66 @@ pub struct CodexDeviceLogin {
     pub error_text: Option<String>,
     pub created_at: i64,
     pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CronJob {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub mode: String,          // agent | message
+    pub schedule_kind: String, // every | cron | at
+    pub every_seconds: Option<i64>,
+    pub cron_expr: Option<String>,
+    pub at_ts: Option<i64>,
+    pub workspace_id: String,
+    pub channel_id: String,
+    pub thread_ts: String,
+    pub prompt_text: String,
+    pub next_run_at: Option<i64>,
+    pub last_run_at: Option<i64>,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GuardrailRule {
+    pub id: String,
+    pub name: String,
+    pub kind: String,         // command | web_fetch | ...
+    pub pattern_kind: String, // regex | exact | substring
+    pub pattern: String,
+    pub action: String, // allow | require_approval | deny
+    pub priority: i64,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Approval {
+    pub id: String,
+    pub kind: String,   // command_execution | guardrail_rule_add | cron_job_add
+    pub status: String, // pending | approved | denied | expired
+    pub decision: Option<String>,
+    pub workspace_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub thread_ts: Option<String>,
+    pub requested_by_user_id: Option<String>,
+    pub details_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub resolved_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelegramMessage {
+    pub chat_id: String,
+    pub message_id: i64,
+    pub from_user_id: Option<String>,
+    pub is_bot: bool,
+    pub text: Option<String>,
+    pub ts: i64,
 }

@@ -1,0 +1,150 @@
+{% extends "layout.html" %}
+{% block title %}Grail | Cron{% endblock %}
+{% block content %}
+  <h2 style="margin:0 0 10px 0; font-weight:700;">Cron</h2>
+
+  <div class="grid" style="margin-bottom: 14px;">
+    <div class="kv">
+      <div class="k">Cron Enabled</div>
+      <div class="v">
+        {% if cron_enabled %}
+          <span class="pill ok">enabled</span>
+        {% else %}
+          <span class="pill bad">disabled</span>
+        {% endif %}
+      </div>
+      <div style="margin-top: 10px; color: var(--muted);">
+        Enable/disable in <a href="/admin/settings">Settings</a>.
+      </div>
+    </div>
+
+    <div class="kv">
+      <div class="k">Workspace ID</div>
+      <div class="v">
+        {% if workspace_id != "" %}
+          <span class="pill">{{ workspace_id }}</span>
+        {% else %}
+          <span class="pill bad">missing</span>
+        {% endif %}
+      </div>
+      <div style="margin-top: 10px; color: var(--muted);">
+        Workspace ID is pinned on the first valid Slack event. Mention Grail once in Slack if this is empty.
+      </div>
+    </div>
+  </div>
+
+  <h3 style="margin:18px 0 10px 0;">Add Job</h3>
+  <form method="post" action="/admin/cron/add">
+    <label for="name">Name</label>
+    <input id="name" name="name" type="text" placeholder="daily-summary" />
+
+    <label for="channel_id">Channel ID</label>
+    <input id="channel_id" name="channel_id" type="text" placeholder="C0123..." />
+
+    <label for="thread_ts">Thread TS (optional)</label>
+    <input id="thread_ts" name="thread_ts" type="text" placeholder="Leave blank to post in channel" />
+
+    <label for="prompt_text">Prompt</label>
+    <input id="prompt_text" name="prompt_text" type="text" placeholder="Summarize the last 50 messages and post key action items." />
+
+    <label for="mode">Mode</label>
+    <select id="mode" name="mode">
+      <option value="agent" selected>Agent (Codex)</option>
+      <option value="message">Message (post prompt as-is)</option>
+    </select>
+
+    <label for="schedule_kind">Schedule</label>
+    <select id="schedule_kind" name="schedule_kind">
+      <option value="every">Every N seconds</option>
+      <option value="cron">Cron expression</option>
+      <option value="at">At (unix seconds)</option>
+    </select>
+
+    <label for="every_seconds">Every seconds (for "every")</label>
+    <input id="every_seconds" name="every_seconds" type="number" min="1" placeholder="3600" />
+
+    <label for="cron_expr">Cron expr (for "cron")</label>
+    <input id="cron_expr" name="cron_expr" type="text" placeholder="0 9 * * *" />
+
+    <label for="at_ts">At ts (for "at")</label>
+    <input id="at_ts" name="at_ts" type="number" min="1" placeholder="1700000000" />
+
+    <div style="display:flex; align-items:center; gap:10px; margin-top:12px;">
+      <input id="enabled" name="enabled" type="checkbox" value="1" checked style="width:auto;" />
+      <label for="enabled" style="margin:0; color: var(--text);">Enabled</label>
+    </div>
+
+    <button type="submit">Create Job</button>
+  </form>
+
+  <h3 style="margin:18px 0 10px 0;">Jobs</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Enabled</th>
+        <th>Name</th>
+        <th>Mode</th>
+        <th>Schedule</th>
+        <th>Target</th>
+        <th>Prompt</th>
+        <th>Next</th>
+        <th>Last</th>
+        <th>Status</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for j in jobs %}
+        <tr>
+          <td>{{ j.id }}</td>
+          <td>{% if j.enabled %}<span class="pill ok">yes</span>{% else %}<span class="pill bad">no</span>{% endif %}</td>
+          <td>{{ j.name }}</td>
+          <td style="color: var(--muted);">{{ j.mode }}</td>
+          <td style="color: var(--muted);">{{ j.schedule }}</td>
+          <td style="color: var(--muted);">
+            {{ j.channel_id }}
+            {% if j.thread_ts != "" %}
+              <div style="margin-top:4px;">thread={{ j.thread_ts }}</div>
+            {% else %}
+              <div style="margin-top:4px;">(channel)</div>
+            {% endif %}
+          </td>
+          <td style="max-width: 420px; color: var(--muted);">{{ j.prompt_text }}</td>
+          <td style="color: var(--muted);">{{ j.next_run_at }}</td>
+          <td style="color: var(--muted);">{{ j.last_run_at }}</td>
+          <td style="color: var(--muted);">
+            {% if j.last_status != "" %}
+              {{ j.last_status }}
+            {% endif %}
+            {% if j.last_error != "" %}
+              <div style="margin-top:4px; color: rgba(255,107,107,0.95);">{{ j.last_error }}</div>
+            {% endif %}
+          </td>
+          <td>
+            {% if j.enabled %}
+              <form method="post" action="/admin/cron/{{ j.id }}/disable">
+                <button type="submit" style="margin-top:0; padding:6px 10px; font-size:12px;">
+                  Disable
+                </button>
+              </form>
+            {% else %}
+              <form method="post" action="/admin/cron/{{ j.id }}/enable">
+                <button type="submit" style="margin-top:0; padding:6px 10px; font-size:12px;">
+                  Enable
+                </button>
+              </form>
+            {% endif %}
+
+            <form method="post" action="/admin/cron/{{ j.id }}/delete">
+              <button type="submit" style="margin-top:8px; padding:6px 10px; font-size:12px; border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
+                Delete
+              </button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

@@ -1,0 +1,38 @@
+{% extends "layout.html" %}
+{% block title %}Grail | Memory{% endblock %}
+{% block content %}
+  <h2 style="margin:0 0 10px 0; font-weight:700;">Memory</h2>
+  <p style="margin:0 0 12px 0; color: var(--muted);">
+    Sessions are stored per conversation. Clearing a session resets its rolling memory summary and Codex thread mapping.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Conversation</th>
+        <th>Codex Thread</th>
+        <th>Memory Summary</th>
+        <th>Last Used</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in sessions %}
+        <tr>
+          <td style="max-width: 340px;">{{ s.conversation_key }}</td>
+          <td style="max-width: 240px; color: var(--muted);">{{ s.codex_thread_id }}</td>
+          <td style="max-width: 420px; color: var(--muted);">{{ s.memory_summary }}</td>
+          <td style="color: var(--muted);">{{ s.last_used_at }}</td>
+          <td>
+            <form method="post" action="/admin/memory/clear">
+              <input type="hidden" name="conversation_key" value="{{ s.conversation_key }}" />
+              <button type="submit" style="margin-top:0; padding:6px 10px; font-size:12px; border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
+                Clear
+              </button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+
