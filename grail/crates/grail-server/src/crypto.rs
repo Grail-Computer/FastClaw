@@ -26,7 +26,13 @@ impl Crypto {
 
         let ciphertext = self
             .cipher
-            .encrypt(nonce, aes_gcm::aead::Payload { msg: plaintext, aad })
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("encrypt failed"))?;
 
         Ok((nonce_bytes.to_vec(), ciphertext))
@@ -37,7 +43,13 @@ impl Crypto {
         let nonce = Nonce::from_slice(nonce);
         let plaintext = self
             .cipher
-            .decrypt(nonce, aes_gcm::aead::Payload { msg: ciphertext, aad })
+            .decrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("decrypt failed"))?;
         Ok(plaintext)
     }

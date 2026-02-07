@@ -204,9 +204,9 @@ pub async fn write_chatgpt_auth_json(
     tokens: &ExchangedTokens,
 ) -> anyhow::Result<()> {
     use std::fs::OpenOptions;
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    use std::io::Write;
 
     tokio::fs::create_dir_all(codex_home)
         .await
@@ -235,10 +235,13 @@ pub async fn write_chatgpt_auth_json(
         {
             options.mode(0o600);
         }
-        let mut f = options.open(&path2).with_context(|| format!("open {}", path2.display()))?;
+        let mut f = options
+            .open(&path2)
+            .with_context(|| format!("open {}", path2.display()))?;
         f.write_all(s.as_bytes())
             .with_context(|| format!("write {}", path2.display()))?;
-        f.flush().with_context(|| format!("flush {}", path2.display()))?;
+        f.flush()
+            .with_context(|| format!("flush {}", path2.display()))?;
         Ok(())
     })
     .await
@@ -259,4 +262,3 @@ pub async fn delete_auth_json(codex_home: &Path) -> anyhow::Result<bool> {
 pub fn default_device_login_timeout() -> Duration {
     Duration::from_secs(15 * 60)
 }
-

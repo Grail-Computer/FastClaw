@@ -2,8 +2,6 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::Context;
-use rmcp::ErrorData as McpError;
-use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParam;
 use rmcp::model::CallToolResult;
@@ -13,6 +11,8 @@ use rmcp::model::PaginatedRequestParam;
 use rmcp::model::ServerCapabilities;
 use rmcp::model::ServerInfo;
 use rmcp::model::Tool;
+use rmcp::ErrorData as McpError;
+use rmcp::ServiceExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::task;
@@ -166,10 +166,7 @@ impl SlackMcpServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let ok = value
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         if !ok {
             let err = value
                 .get("error")
@@ -294,7 +291,10 @@ impl ServerHandler for SlackMcpServer {
             "get_channel_history" => {
                 let args = parse_args::<ArgsGetChannelHistory>(&request, "get_channel_history")?;
                 let limit = args.limit.unwrap_or(20).clamp(1, 200);
-                let mut query = vec![("channel", args.channel.clone()), ("limit", limit.to_string())];
+                let mut query = vec![
+                    ("channel", args.channel.clone()),
+                    ("limit", limit.to_string()),
+                ];
                 if let Some(ts) = args.before_ts {
                     query.push(("latest", ts));
                     query.push(("inclusive", "false".to_string()));
@@ -440,4 +440,3 @@ async fn main() -> anyhow::Result<()> {
     task::yield_now().await;
     Ok(())
 }
-

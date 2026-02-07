@@ -40,7 +40,10 @@ pub async fn worker_loop(state: AppState) {
 
         match db::reset_running_tasks(&state.pool).await {
             Ok(n) if n > 0 => {
-                warn!(count = n, "re-queued tasks left in running state after worker restart");
+                warn!(
+                    count = n,
+                    "re-queued tasks left in running state after worker restart"
+                );
             }
             Ok(_) => {}
             Err(err) => {
@@ -67,7 +70,8 @@ pub async fn worker_loop(state: AppState) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(RENEW_EVERY_SECONDS)).await;
-                match db::try_acquire_or_renew_worker_lock(&pool, &worker_id2, LEASE_SECONDS).await {
+                match db::try_acquire_or_renew_worker_lock(&pool, &worker_id2, LEASE_SECONDS).await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         warn!(%worker_id2, "lost worker lock");
@@ -110,18 +114,19 @@ pub async fn worker_loop(state: AppState) {
                             }
                         }
                         Err(err) => {
-                        let msg = format!("{err:#}");
-                        warn!(error = %msg, task_id, "task failed");
-                        let _ = db::complete_task_failure(&state.pool, task_id, &msg).await;
+                            let msg = format!("{err:#}");
+                            warn!(error = %msg, task_id, "task failed");
+                            let _ = db::complete_task_failure(&state.pool, task_id, &msg).await;
 
-                        if let Ok(Some(token)) = crate::secrets::load_slack_bot_token_opt(&state).await
-                        {
-                            let slack = SlackClient::new(state.http.clone(), token);
-                            let user_msg = format!(
+                            if let Ok(Some(token)) =
+                                crate::secrets::load_slack_bot_token_opt(&state).await
+                            {
+                                let slack = SlackClient::new(state.http.clone(), token);
+                                let user_msg = format!(
                                 "Task #{task_id} failed. Check /admin/tasks for details.\n\nError: {short}",
                                 short = shorten_error(&msg)
                             );
-                            let _ = slack
+                                let _ = slack
                                     .post_message(&task.channel_id, &task.thread_ts, &user_msg)
                                     .await;
                             }
@@ -164,15 +169,17 @@ async fn process_task(
     let slack = SlackClient::new(state.http.clone(), slack_bot_token.clone());
 
     let ctx = if task.thread_ts != task.event_ts {
-        slack.fetch_thread_replies(
-            &task.channel_id,
-            &task.thread_ts,
-            &task.event_ts,
-            settings.context_last_n,
-        )
-        .await?
+        slack
+            .fetch_thread_replies(
+                &task.channel_id,
+                &task.thread_ts,
+                &task.event_ts,
+                settings.context_last_n,
+            )
+            .await?
     } else {
-        slack.fetch_channel_history(&task.channel_id, &task.event_ts, settings.context_last_n)
+        slack
+            .fetch_channel_history(&task.channel_id, &task.event_ts, settings.context_last_n)
             .await?
     };
 
@@ -284,7 +291,8 @@ async fn process_task(
     db::upsert_session(&state.pool, &session).await?;
 
     // Reply in Slack.
-    slack.post_message(&task.channel_id, &task.thread_ts, &slack_reply)
+    slack
+        .post_message(&task.channel_id, &task.thread_ts, &slack_reply)
         .await?;
 
     info!(task_id = task.id, "replied to slack");
@@ -305,7 +313,11 @@ fn conversation_key_for_task(task: &crate::models::Task) -> String {
 fn format_slack_context(messages: &[crate::slack::SlackMessage]) -> String {
     let mut out = String::new();
     for (i, m) in messages.iter().enumerate() {
-        let who = m.user.as_deref().or(m.bot_id.as_deref()).unwrap_or("unknown");
+        let who = m
+            .user
+            .as_deref()
+            .or(m.bot_id.as_deref())
+            .unwrap_or("unknown");
         let text = m.text.clone().unwrap_or_default().replace('\n', " ");
         out.push_str(&format!("{:02}. {} {}: {}\n", i + 1, m.ts, who, text));
     }
@@ -325,7 +337,10 @@ fn build_turn_input(
     s.push_str(&format!("- workspace_id: {}\n", task.workspace_id));
     s.push_str(&format!("- channel_id: {}\n", task.channel_id));
     s.push_str(&format!("- thread_ts: {}\n", task.thread_ts));
-    s.push_str(&format!("- requested_by: <@{}>\n", task.requested_by_user_id));
+    s.push_str(&format!(
+        "- requested_by: <@{}>\n",
+        task.requested_by_user_id
+    ));
     s.push_str(&format!("- event_ts: {}\n\n", task.event_ts));
 
     s.push_str("Session memory summary (rolling, durable, no secrets):\n");
@@ -351,7 +366,9 @@ fn build_turn_input(
     ));
 
     if allow_slack_mcp {
-        s.push_str("Slack tools are enabled. If you need more context, use the Slack MCP tools.\n\n");
+        s.push_str(
+            "Slack tools are enabled. If you need more context, use the Slack MCP tools.\n\n",
+        );
     } else {
         s.push_str("Slack tools are disabled; rely on the provided context.\n\n");
     }
@@ -418,7 +435,10 @@ fn strip_code_fences(s: &str) -> &str {
     s
 }
 
-async fn apply_context_writes(context_dir: &std::path::Path, writes: &[ContextWrite]) -> anyhow::Result<()> {
+async fn apply_context_writes(
+    context_dir: &std::path::Path,
+    writes: &[ContextWrite],
+) -> anyhow::Result<()> {
     const MAX_WRITES: usize = 20;
     const MAX_TOTAL_CHARS: usize = 300_000;
     const MAX_FILE_CHARS: usize = 200_000;

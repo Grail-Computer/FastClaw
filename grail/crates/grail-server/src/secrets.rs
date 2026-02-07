@@ -5,7 +5,11 @@ use crate::AppState;
 
 fn normalize_nonempty(s: String) -> Option<String> {
     let v = s.trim().to_string();
-    if v.is_empty() { None } else { Some(v) }
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 pub async fn load_openai_api_key_opt(state: &AppState) -> anyhow::Result<Option<String>> {
@@ -74,4 +78,3 @@ pub async fn load_slack_signing_secret_opt(state: &AppState) -> anyhow::Result<O
 pub async fn slack_signing_secret_configured(state: &AppState) -> anyhow::Result<bool> {
     Ok(load_slack_signing_secret_opt(state).await?.is_some())
 }
-

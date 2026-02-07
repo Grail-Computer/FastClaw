@@ -30,13 +30,15 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
-use crate::crypto::{Crypto, parse_master_key};
+use crate::crypto::{parse_master_key, Crypto};
 use crate::models::PermissionsMode;
 use crate::secrets::{
     openai_api_key_configured, slack_bot_token_configured, slack_signing_secret_configured,
 };
 use crate::slack::{verify_slack_signature, SlackClient};
-use crate::templates::{AuthTemplate, DeviceLoginRow, SettingsTemplate, StatusTemplate, TasksTemplate};
+use crate::templates::{
+    AuthTemplate, DeviceLoginRow, SettingsTemplate, StatusTemplate, TasksTemplate,
+};
 
 type AppResult<T> = Result<T, AppError>;
 
@@ -117,7 +119,10 @@ async fn main() -> anyhow::Result<()> {
     let admin = Router::new()
         .route("/", get(|| async { Redirect::to("/admin/status") }))
         .route("/status", get(admin_status))
-        .route("/settings", get(admin_settings_get).post(admin_settings_post))
+        .route(
+            "/settings",
+            get(admin_settings_get).post(admin_settings_post),
+        )
         .route("/auth", get(admin_auth_get))
         .route("/auth/device/start", post(admin_auth_device_start))
         .route("/auth/device/cancel", post(admin_auth_device_cancel))
@@ -362,7 +367,10 @@ mod tests {
     #[test]
     fn host_from_url_parses_host_without_port() {
         assert_eq!(host_from_url("https://example.com"), Some("example.com"));
-        assert_eq!(host_from_url("https://example.com:123"), Some("example.com"));
+        assert_eq!(
+            host_from_url("https://example.com:123"),
+            Some("example.com")
+        );
         assert_eq!(
             host_from_url("https://user:pass@example.com:123/x/y"),
             Some("example.com")
@@ -562,12 +570,18 @@ async fn admin_tasks(State(state): State<AppState>) -> AppResult<Html<String>> {
     Ok(Html(tpl.render()?))
 }
 
-async fn admin_task_cancel(State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Redirect> {
+async fn admin_task_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Redirect> {
     let _ = db::cancel_task(&state.pool, id).await?;
     Ok(Redirect::to("/admin/tasks"))
 }
 
-async fn admin_task_retry(State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Redirect> {
+async fn admin_task_retry(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Redirect> {
     let _ = db::retry_task(&state.pool, id).await?;
     Ok(Redirect::to("/admin/tasks"))
 }
@@ -672,7 +686,9 @@ async fn slack_events(
 ) -> impl IntoResponse {
     let secret = match crate::secrets::load_slack_signing_secret_opt(&state).await {
         Ok(Some(v)) => v,
-        Ok(None) => return (StatusCode::SERVICE_UNAVAILABLE, "slack not configured").into_response(),
+        Ok(None) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "slack not configured").into_response()
+        }
         Err(err) => {
             warn!(error = %err, "failed to load slack signing secret");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
@@ -712,15 +728,14 @@ async fn slack_events(
                 return (StatusCode::OK, "").into_response();
             };
 
-            let processed = match db::try_mark_event_processed(&state.pool, &team_id, &event_id)
-                .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    error!(error = %err, "failed to dedupe event");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
-                }
-            };
+            let processed =
+                match db::try_mark_event_processed(&state.pool, &team_id, &event_id).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        error!(error = %err, "failed to dedupe event");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+                    }
+                };
 
             if !processed {
                 return (StatusCode::OK, "").into_response();
@@ -753,7 +768,8 @@ async fn slack_events(
                     let slack = SlackClient::new(state.http.clone(), token);
                     let queued_text = format!("Queued as #{task_id}. I'll start soon.");
                     tokio::spawn(async move {
-                        if let Err(err) = slack.post_message(&channel, &thread_ts, &queued_text).await
+                        if let Err(err) =
+                            slack.post_message(&channel, &thread_ts, &queued_text).await
                         {
                             warn!(error = %err, "failed to post queued message");
                         }
@@ -817,7 +833,8 @@ async fn run_device_login_flow(
             return Ok(());
         }
 
-        match crate::codex_login::poll_device_auth(&http, &issuer, &device_auth_id, &user_code).await
+        match crate::codex_login::poll_device_auth(&http, &issuer, &device_auth_id, &user_code)
+            .await
         {
             Ok(crate::codex_login::DeviceAuthPoll::Pending) => {
                 tokio::time::sleep(Duration::from_secs(interval_sec.max(1).min(30))).await;

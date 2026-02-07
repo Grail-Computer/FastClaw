@@ -54,7 +54,9 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
         model: row.get::<Option<String>, _>("model"),
         reasoning_effort: row.get::<Option<String>, _>("reasoning_effort"),
         reasoning_summary: row.get::<Option<String>, _>("reasoning_summary"),
-        permissions_mode: PermissionsMode::from_db_str(row.get::<String, _>("permissions_mode").as_str()),
+        permissions_mode: PermissionsMode::from_db_str(
+            row.get::<String, _>("permissions_mode").as_str(),
+        ),
         allow_slack_mcp: row.get::<i64, _>("allow_slack_mcp") != 0,
         allow_context_writes: row.get::<i64, _>("allow_context_writes") != 0,
         shell_network_access: row.get::<i64, _>("shell_network_access") != 0,
@@ -62,10 +64,7 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
     })
 }
 
-pub async fn update_settings(
-    pool: &SqlitePool,
-    settings: &Settings,
-) -> anyhow::Result<()> {
+pub async fn update_settings(pool: &SqlitePool, settings: &Settings) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         UPDATE settings
@@ -129,7 +128,10 @@ pub async fn delete_secret(pool: &SqlitePool, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn read_secret(pool: &SqlitePool, key: &str) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+pub async fn read_secret(
+    pool: &SqlitePool,
+    key: &str,
+) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
     let row = sqlx::query("SELECT nonce, ciphertext FROM secrets WHERE key = ?1")
         .bind(key)
         .fetch_optional(pool)
@@ -647,7 +649,10 @@ pub async fn list_recent_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<
         .collect())
 }
 
-pub async fn get_session(pool: &SqlitePool, conversation_key: &str) -> anyhow::Result<Option<Session>> {
+pub async fn get_session(
+    pool: &SqlitePool,
+    conversation_key: &str,
+) -> anyhow::Result<Option<Session>> {
     let row = sqlx::query(
         r#"
         SELECT

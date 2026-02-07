@@ -54,8 +54,7 @@ pub fn verify_slack_signature(
         return Err(SlackSignatureError::TimestampTooOld);
     }
 
-    let mut mac =
-        HmacSha256::new_from_slice(signing_secret.as_bytes()).expect("HMAC key valid");
+    let mut mac = HmacSha256::new_from_slice(signing_secret.as_bytes()).expect("HMAC key valid");
     mac.update(b"v0:");
     mac.update(timestamp.as_bytes());
     mac.update(b":");

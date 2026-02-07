@@ -171,7 +171,10 @@ impl CodexManager {
 
         if let Some(thread_id) = existing_thread_id {
             let res = proc
-                .request("thread/resume", json!({ "threadId": thread_id }).merge(&params))
+                .request(
+                    "thread/resume",
+                    json!({ "threadId": thread_id }).merge(&params),
+                )
                 .await?;
             let id = res
                 .get("thread")
@@ -261,10 +264,7 @@ impl CodexManager {
 
             // Server-initiated requests (approvals).
             if is_server_request(&msg) {
-                let method = msg
-                    .get("method")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
                 let id = msg.get("id").cloned().unwrap_or(json!(null));
                 let params = msg.get("params").cloned().unwrap_or(json!({}));
 
@@ -301,7 +301,10 @@ impl CodexManager {
 
             match method {
                 "error" => {
-                    let p_thread_id = params.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
+                    let p_thread_id = params
+                        .get("threadId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let p_turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
                     if p_thread_id == thread_id && p_turn_id == turn_id {
                         let msg = params
@@ -313,7 +316,10 @@ impl CodexManager {
                     }
                 }
                 "item/started" => {
-                    let p_thread_id = params.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
+                    let p_thread_id = params
+                        .get("threadId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let p_turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
                     if p_thread_id != thread_id || p_turn_id != turn_id {
                         continue;
@@ -342,7 +348,10 @@ impl CodexManager {
                     }
                 }
                 "item/agentMessage/delta" => {
-                    let p_thread_id = params.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
+                    let p_thread_id = params
+                        .get("threadId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let p_turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
                     if p_thread_id == thread_id && p_turn_id == turn_id {
                         let item_id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or("");
@@ -359,7 +368,10 @@ impl CodexManager {
                     }
                 }
                 "item/completed" => {
-                    let p_thread_id = params.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
+                    let p_thread_id = params
+                        .get("threadId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let p_turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
                     if p_thread_id != thread_id || p_turn_id != turn_id {
                         continue;
@@ -377,7 +389,10 @@ impl CodexManager {
                     }
                 }
                 "turn/completed" => {
-                    let p_thread_id = params.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
+                    let p_thread_id = params
+                        .get("threadId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let p_turn = params.get("turn").cloned().unwrap_or(json!({}));
                     let p_turn_id = p_turn.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if p_thread_id != thread_id || p_turn_id != turn_id {
@@ -571,10 +586,7 @@ impl CodexProc {
                 if let Some(err) = msg.get("error") {
                     anyhow::bail!("codex error response: {err}");
                 }
-                let result = msg
-                    .get("result")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
+                let result = msg.get("result").cloned().unwrap_or_else(|| json!({}));
                 return Ok(result);
             }
 
@@ -603,8 +615,13 @@ impl CodexProc {
         self.write_line(&msg).await
     }
 
-    async fn respond(&mut self, id: serde_json::Value, result: serde_json::Value) -> anyhow::Result<()> {
-        self.write_line(&json!({ "id": id, "result": result })).await
+    async fn respond(
+        &mut self,
+        id: serde_json::Value,
+        result: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.write_line(&json!({ "id": id, "result": result }))
+            .await
     }
 }
 
@@ -615,7 +632,11 @@ fn is_server_request(msg: &serde_json::Value) -> bool {
         && msg.get("error").is_none()
 }
 
-fn decide_command_approval(settings: &Settings, params: &serde_json::Value, cwd: &Path) -> &'static str {
+fn decide_command_approval(
+    settings: &Settings,
+    params: &serde_json::Value,
+    cwd: &Path,
+) -> &'static str {
     if settings.permissions_mode != PermissionsMode::Full {
         return "decline";
     }
