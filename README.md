@@ -16,6 +16,8 @@ Grail will:
 
 This repo is Rust-first (server + Slack MCP server), and uses the open-source Codex CLI app-server for the agent runtime.
 
+Note: the `Dockerfile` downloads a pinned Codex release (`CODEX_VERSION` build arg). Update that version periodically if you want newer Codex behavior.
+
 ## Deploy On Railway (Recommended)
 
 1. Create a new Railway project from this repo.
