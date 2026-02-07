@@ -1,27 +1,26 @@
 {% extends "layout.html" %}
 {% block title %}Grail | Context{% endblock %}
 {% block content %}
-  <h2 style="margin:0 0 10px 0; font-weight:700;">Context</h2>
-  <p style="margin:0 0 12px 0; color: var(--muted);">
-    Files under <span class="pill">/data/context</span> are durable and visible to Grail. Edit carefully.
+  <h2>Context</h2>
+  <p class="section-desc">
+    Durable files under <span class="pill">/data/context</span> visible to the agent. Edit carefully.
   </p>
   <table>
     <thead>
       <tr>
         <th>Path</th>
-        <th>Bytes</th>
+        <th>Size</th>
         <th>Actions</th>
       </tr>
     </thead>
     <tbody>
       {% for f in files %}
         <tr>
-          <td>{{ f.path }}</td>
-          <td style="color: var(--muted);">{{ f.bytes }}</td>
+          <td style="font-family: var(--font-mono); font-size: 13px;">{{ f.path }}</td>
+          <td class="text-muted" style="font-family: var(--font-mono); font-size: 12px;">{{ f.bytes }} B</td>
           <td><a href="{{ f.edit_url }}">Edit</a></td>
         </tr>
       {% endfor %}
     </tbody>
   </table>
 {% endblock %}
-

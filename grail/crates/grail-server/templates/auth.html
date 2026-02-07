@@ -1,11 +1,12 @@
 {% extends "layout.html" %}
 {% block title %}Grail | Auth{% endblock %}
 {% block content %}
-  <h2 style="margin:0 0 10px 0; font-weight:700;">Auth</h2>
+  <h2>Auth</h2>
+  <p class="section-desc">Manage API keys and ChatGPT device login for the Codex backend.</p>
 
-  <div class="grid" style="margin-bottom: 14px;">
+  <div class="grid mb-md">
     <div class="kv">
-      <div class="k">OPENAI_API_KEY</div>
+      <div class="k">OpenAI API Key</div>
       <div class="v">
         {% if openai_api_key_set %}
           <span class="pill ok">set</span>
@@ -14,7 +15,6 @@
         {% endif %}
       </div>
     </div>
-
     <div class="kv">
       <div class="k">CODEX_HOME/auth.json</div>
       <div class="v">
@@ -24,58 +24,52 @@
           <span class="pill bad">missing</span>
         {% endif %}
         {% if codex_auth_mode != "" %}
-          <span class="pill">{{ codex_auth_mode }}</span>
+          <span class="pill" style="margin-left: 6px;">{{ codex_auth_mode }}</span>
         {% endif %}
       </div>
     </div>
   </div>
 
-  <h3 style="margin:18px 0 10px 0;">ChatGPT Device Login (Codex)</h3>
+  <div class="form-section">
+    <div class="form-section-title">ChatGPT Device Login (Codex)</div>
+    <p class="text-muted" style="margin: 0 0 12px 0; font-size: 13px;">
+      Log in with ChatGPT via a device code flow. Tokens are persisted to
+      <span class="pill">/data/codex/auth.json</span>.
+    </p>
 
-  <p style="margin: 0 0 10px 0; color: var(--muted);">
-    If you don't want to use an API key, you can log in with ChatGPT via a device code flow.
-    This writes tokens to <span class="pill">/data/codex/auth.json</span> (persistent volume).
-  </p>
-
-  {% if device_login.is_some() %}
-    {% let dl = device_login.as_ref().unwrap() %}
-    <div class="kv" style="margin-bottom: 12px;">
-      <div class="k">Latest device login</div>
-      <div class="v">
-        <span class="pill">{{ dl.status }}</span>
-        <span class="pill">created_at={{ dl.created_at }}</span>
+    {% if device_login.is_some() %}
+      {% let dl = device_login.as_ref().unwrap() %}
+      <div class="kv mb-md">
+        <div class="k">Latest Device Login</div>
+        <div class="v">
+          <span class="pill">{{ dl.status }}</span>
+          <span class="pill" style="margin-left: 6px;">{{ dl.created_at }}</span>
+        </div>
+        {% if dl.status == "pending" %}
+          <div class="mt-sm" style="font-size: 13px;">
+            <p class="text-muted" style="margin: 8px 0 4px 0;">1. Open:</p>
+            <a href="{{ dl.verification_url }}" target="_blank" rel="noreferrer">{{ dl.verification_url }}</a>
+            <p class="text-muted" style="margin: 12px 0 4px 0;">2. Enter code (expires in ~15 min):</p>
+            <span class="pill" style="font-size: 16px; color: var(--text); padding: 6px 16px;">{{ dl.user_code }}</span>
+            <p class="text-muted" style="margin: 12px 0 0 0; font-size: 12px;">Refresh when login completes.</p>
+          </div>
+          <form method="post" action="/admin/auth/device/cancel">
+            <button type="submit" class="btn-danger">Cancel Pending Login</button>
+          </form>
+        {% endif %}
+        {% if dl.status == "failed" && dl.error_text != "" %}
+          <div class="mt-sm text-danger" style="font-size: 13px;">
+            Error: {{ dl.error_text }}
+          </div>
+        {% endif %}
       </div>
-      {% if dl.status == "pending" %}
-        <div style="margin-top: 10px; color: var(--muted);">
-          <div style="margin-bottom: 6px;">1) Open:</div>
-          <div><a href="{{ dl.verification_url }}" target="_blank" rel="noreferrer">{{ dl.verification_url }}</a></div>
-          <div style="margin: 10px 0 6px 0;">2) Enter code (expires in ~15 minutes):</div>
-          <div class="pill" style="font-size: 16px; color: var(--text);">{{ dl.user_code }}</div>
-          <div style="margin-top: 10px;">This page will update when the login completes. Refresh if needed.</div>
-        </div>
+    {% endif %}
 
-        <form method="post" action="/admin/auth/device/cancel">
-          <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-            Cancel Pending Login
-          </button>
-        </form>
-      {% endif %}
-
-      {% if dl.status == "failed" && dl.error_text != "" %}
-        <div style="margin-top: 10px; color: rgba(255,107,107,0.95);">
-          Error: {{ dl.error_text }}
-        </div>
-      {% endif %}
-    </div>
-  {% endif %}
-
-  <form method="post" action="/admin/auth/device/start">
-    <button type="submit">Start Device Login</button>
-  </form>
-
-  <form method="post" action="/admin/auth/logout">
-    <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-      Logout (Delete auth.json)
-    </button>
-  </form>
+    <form method="post" action="/admin/auth/device/start">
+      <button type="submit">Start Device Login</button>
+    </form>
+    <form method="post" action="/admin/auth/logout" style="display: inline-block;">
+      <button type="submit" class="btn-danger">Logout (Delete auth.json)</button>
+    </form>
+  </div>
 {% endblock %}

@@ -1,18 +1,22 @@
 {% extends "layout.html" %}
 {% block title %}Grail | Settings{% endblock %}
 {% block content %}
-  <h2 style="margin:0 0 10px 0; font-weight:700;">Settings</h2>
+  <h2>Settings</h2>
+  <p class="section-desc">Configure the agent's identity, permissions, and integrations.</p>
+
   <form method="post" action="/admin/settings">
+    <h3>Identity</h3>
     <label for="agent_name">Agent name</label>
     <input id="agent_name" name="agent_name" type="text" maxlength="48" value="{{ agent_name }}" />
 
-    <label for="role_description">Role description (optional)</label>
+    <label for="role_description">Role description</label>
     <textarea id="role_description" name="role_description" rows="5" placeholder="Describe the employee's role, boundaries, and what 'good' looks like.">{{ role_description }}</textarea>
 
+    <h3>Model</h3>
     <label for="context_last_n">Slack context: last N messages</label>
     <input id="context_last_n" name="context_last_n" type="number" min="1" max="200" value="{{ context_last_n }}" />
 
-    <label for="model">Model (optional override)</label>
+    <label for="model">Model override</label>
     <input id="model" name="model" type="text" placeholder="e.g. gpt-5.1-codex" value="{{ model }}" />
 
     <label for="reasoning_effort">Reasoning effort</label>
@@ -35,93 +39,91 @@
       <option value="none" {% if reasoning_summary == "none" %}selected{% endif %}>none</option>
     </select>
 
+    <h3>Permissions</h3>
     <label for="permissions_mode">Agent permissions</label>
     <select id="permissions_mode" name="permissions_mode">
       <option value="read" {% if permissions_mode == "read" %}selected{% endif %}>Read-only (no commands, no writes)</option>
       <option value="full" {% if permissions_mode == "full" %}selected{% endif %}>Full (commands + context writes)</option>
     </select>
 
-    <label for="command_approval_mode">Command approval mode (full mode only)</label>
+    <label for="command_approval_mode">Command approval mode</label>
     <select id="command_approval_mode" name="command_approval_mode">
       <option value="guardrails" {% if command_approval_mode == "guardrails" %}selected{% endif %}>Guardrails (only prompt on risky commands)</option>
       <option value="always_ask" {% if command_approval_mode == "always_ask" %}selected{% endif %}>Always ask for approval</option>
       <option value="auto" {% if command_approval_mode == "auto" %}selected{% endif %}>Auto-approve (not recommended)</option>
     </select>
 
-    <label for="slack_allow_from">Slack allow list (optional)</label>
-    <input id="slack_allow_from" name="slack_allow_from" type="text" placeholder="Comma/space/newline separated Slack user IDs (e.g. U0123...)" value="{{ slack_allow_from }}" />
+    <div style="display:flex; align-items:center; gap:10px; margin-top:14px;">
+      <input id="allow_context_writes" name="allow_context_writes" type="checkbox" value="1" {% if allow_context_writes %}checked{% endif %} style="width:auto;" />
+      <label for="allow_context_writes" style="margin:0; color: var(--text);">Allow writing to /data/context</label>
+    </div>
 
-    <label for="slack_allow_channels">Slack channel allow list (optional)</label>
-    <input id="slack_allow_channels" name="slack_allow_channels" type="text" placeholder="Comma/space/newline separated channel IDs (e.g. C0123..., G0123...); DMs still allowed" value="{{ slack_allow_channels }}" />
+    <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+      <input id="shell_network_access" name="shell_network_access" type="checkbox" value="1" {% if shell_network_access %}checked{% endif %} style="width:auto;" />
+      <label for="shell_network_access" style="margin:0; color: var(--text);">Allow outbound network for shell commands</label>
+    </div>
 
-    <label>Telegram</label>
+    <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+      <input id="auto_apply_guardrail_tighten" name="auto_apply_guardrail_tighten" type="checkbox" value="1" {% if auto_apply_guardrail_tighten %}checked{% endif %} style="width:auto;" />
+      <label for="auto_apply_guardrail_tighten" style="margin:0; color: var(--text);">Auto-apply tightening guardrails from agent</label>
+    </div>
+
+    <h3>Slack</h3>
+    <label for="slack_allow_from">User allow list</label>
+    <input id="slack_allow_from" name="slack_allow_from" type="text" placeholder="Comma-separated Slack user IDs (e.g. U0123...)" value="{{ slack_allow_from }}" />
+
+    <label for="slack_allow_channels">Channel allow list</label>
+    <input id="slack_allow_channels" name="slack_allow_channels" type="text" placeholder="Comma-separated channel IDs; DMs always allowed" value="{{ slack_allow_channels }}" />
+
+    <div style="display:flex; align-items:center; gap:10px; margin-top:14px;">
+      <input id="allow_slack_mcp" name="allow_slack_mcp" type="checkbox" value="1" {% if allow_slack_mcp %}checked{% endif %} style="width:auto;" />
+      <label for="allow_slack_mcp" style="margin:0; color: var(--text);">Enable Slack tools (MCP)</label>
+    </div>
+
+    <h3>Telegram</h3>
     <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
       <input id="allow_telegram" name="allow_telegram" type="checkbox" value="1" {% if allow_telegram %}checked{% endif %} style="width:auto;" />
       <label for="allow_telegram" style="margin:0; color: var(--text);">Enable Telegram webhook</label>
     </div>
-    <label for="telegram_allow_from" style="margin-top: 10px;">Telegram allow list (optional)</label>
-    <input id="telegram_allow_from" name="telegram_allow_from" type="text" placeholder="Comma/space/newline separated Telegram user IDs" value="{{ telegram_allow_from }}" />
+    <label for="telegram_allow_from" style="margin-top: 10px;">User allow list</label>
+    <input id="telegram_allow_from" name="telegram_allow_from" type="text" placeholder="Comma-separated Telegram user IDs" value="{{ telegram_allow_from }}" />
 
-    <label>Slack tools (MCP)</label>
-    <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
-      <input id="allow_slack_mcp" name="allow_slack_mcp" type="checkbox" value="1" {% if allow_slack_mcp %}checked{% endif %} style="width:auto;" />
-      <label for="allow_slack_mcp" style="margin:0; color: var(--text);">Enable Slack tools</label>
-    </div>
-
-    <label>Web tools (MCP)</label>
+    <h3>Web &amp; MCP</h3>
     <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
       <input id="allow_web_mcp" name="allow_web_mcp" type="checkbox" value="1" {% if allow_web_mcp %}checked{% endif %} style="width:auto;" />
       <label for="allow_web_mcp" style="margin:0; color: var(--text);">Enable web tools (Brave search + fetch)</label>
     </div>
 
+    <label for="web_allow_domains">Allow domains</label>
+    <input id="web_allow_domains" name="web_allow_domains" type="text" placeholder="Comma-separated domains (e.g. docs.railway.com)" value="{{ web_allow_domains }}" />
+
+    <label for="web_deny_domains">Deny domains</label>
+    <input id="web_deny_domains" name="web_deny_domains" type="text" placeholder="Comma-separated domains to block" value="{{ web_deny_domains }}" />
+
     <label for="extra_mcp_config">Extra MCP config (advanced)</label>
-    <textarea id="extra_mcp_config" name="extra_mcp_config" rows="8" placeholder="[mcp_servers.mytool]\ncommand = &quot;my-mcp&quot;\nargs = []\nenv_vars = [&quot;MY_API_KEY&quot;]">{{ extra_mcp_config }}</textarea>
-    <p style="margin: 8px 0 0 0; color: var(--muted);">
+    <textarea id="extra_mcp_config" name="extra_mcp_config" rows="6" placeholder="[mcp_servers.mytool]&#10;command = &quot;my-mcp&quot;&#10;args = []&#10;env_vars = [&quot;MY_API_KEY&quot;]">{{ extra_mcp_config }}</textarea>
+    <p class="text-muted mt-sm" style="font-size: 12px;">
       Appended to <span class="pill">CODEX_HOME/config.toml</span>. Avoid putting secrets here.
     </p>
 
-    <label>Context writes</label>
-    <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
-      <input id="allow_context_writes" name="allow_context_writes" type="checkbox" value="1" {% if allow_context_writes %}checked{% endif %} style="width:auto;" />
-      <label for="allow_context_writes" style="margin:0; color: var(--text);">Allow writing to /data/context</label>
-    </div>
-
-    <label>Shell network access (full mode only)</label>
-    <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
-      <input id="shell_network_access" name="shell_network_access" type="checkbox" value="1" {% if shell_network_access %}checked{% endif %} style="width:auto;" />
-      <label for="shell_network_access" style="margin:0; color: var(--text);">Allow outbound network for shell commands</label>
-    </div>
-
-    <label>Cron (scheduled tasks)</label>
+    <h3>Scheduled Tasks</h3>
     <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
       <input id="allow_cron" name="allow_cron" type="checkbox" value="1" {% if allow_cron %}checked{% endif %} style="width:auto;" />
       <label for="allow_cron" style="margin:0; color: var(--text);">Enable cron scheduler</label>
     </div>
-    <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
+    <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
       <input id="auto_apply_cron_jobs" name="auto_apply_cron_jobs" type="checkbox" value="1" {% if auto_apply_cron_jobs %}checked{% endif %} style="width:auto;" />
-      <label for="auto_apply_cron_jobs" style="margin:0; color: var(--text);">Auto-apply agent-proposed cron jobs (not recommended)</label>
+      <label for="auto_apply_cron_jobs" style="margin:0; color: var(--text);">Auto-apply agent-proposed cron jobs</label>
     </div>
 
-    <label>Guardrails</label>
-    <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
-      <input id="auto_apply_guardrail_tighten" name="auto_apply_guardrail_tighten" type="checkbox" value="1" {% if auto_apply_guardrail_tighten %}checked{% endif %} style="width:auto;" />
-      <label for="auto_apply_guardrail_tighten" style="margin:0; color: var(--text);">Auto-apply tightening guardrails proposed by the agent</label>
-    </div>
-
-    <label for="web_allow_domains">Web allow domains (optional)</label>
-    <input id="web_allow_domains" name="web_allow_domains" type="text" placeholder="Comma/space separated domains (e.g. docs.railway.com, github.com)" value="{{ web_allow_domains }}" />
-
-    <label for="web_deny_domains">Web deny domains (optional)</label>
-    <input id="web_deny_domains" name="web_deny_domains" type="text" placeholder="Comma/space separated domains to block" value="{{ web_deny_domains }}" />
-
-    <button type="submit">Save</button>
+    <button type="submit" style="margin-top: 24px;">Save Settings</button>
   </form>
 
-  <h3 style="margin:18px 0 10px 0;">Credentials</h3>
+  <h3>Credentials</h3>
 
-  <div class="grid" style="margin-bottom: 12px;">
+  <div class="grid mb-md">
     <div class="kv">
-      <div class="k">OPENAI_API_KEY</div>
+      <div class="k">OpenAI API Key</div>
       <div class="v">
         {% if openai_api_key_set %}
           <span class="pill ok">set</span>
@@ -130,9 +132,8 @@
         {% endif %}
       </div>
     </div>
-
     <div class="kv">
-      <div class="k">SLACK_SIGNING_SECRET</div>
+      <div class="k">Slack Signing Secret</div>
       <div class="v">
         {% if slack_signing_secret_set %}
           <span class="pill ok">set</span>
@@ -141,9 +142,8 @@
         {% endif %}
       </div>
     </div>
-
     <div class="kv">
-      <div class="k">SLACK_BOT_TOKEN</div>
+      <div class="k">Slack Bot Token</div>
       <div class="v">
         {% if slack_bot_token_set %}
           <span class="pill ok">set</span>
@@ -152,9 +152,8 @@
         {% endif %}
       </div>
     </div>
-
     <div class="kv">
-      <div class="k">TELEGRAM_BOT_TOKEN</div>
+      <div class="k">Telegram Bot Token</div>
       <div class="v">
         {% if telegram_bot_token_set %}
           <span class="pill ok">set</span>
@@ -163,9 +162,8 @@
         {% endif %}
       </div>
     </div>
-
     <div class="kv">
-      <div class="k">TELEGRAM_WEBHOOK_SECRET</div>
+      <div class="k">Telegram Webhook Secret</div>
       <div class="v">
         {% if telegram_webhook_secret_set %}
           <span class="pill ok">set</span>
@@ -174,9 +172,8 @@
         {% endif %}
       </div>
     </div>
-
     <div class="kv">
-      <div class="k">BRAVE_SEARCH_API_KEY</div>
+      <div class="k">Brave Search API Key</div>
       <div class="v">
         {% if brave_search_api_key_set %}
           <span class="pill ok">set</span>
@@ -185,7 +182,6 @@
         {% endif %}
       </div>
     </div>
-
     <div class="kv">
       <div class="k">Storage</div>
       <div class="v">
@@ -199,89 +195,81 @@
   </div>
 
   {% if master_key_set %}
-    <form method="post" action="/admin/secrets/openai">
-      <label for="openai_api_key">Set OpenAI API key</label>
-      <input id="openai_api_key" name="openai_api_key" type="password" placeholder="sk-..." />
-      <button type="submit">Save OpenAI Key</button>
-    </form>
+    <div class="form-section">
+      <div class="form-section-title">Manage Secrets</div>
 
-    <form method="post" action="/admin/secrets/openai/delete">
-      <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-        Clear Stored OpenAI Key
-      </button>
-    </form>
+      <form method="post" action="/admin/secrets/openai">
+        <label for="openai_api_key">OpenAI API key</label>
+        <input id="openai_api_key" name="openai_api_key" type="password" placeholder="sk-..." />
+        <button type="submit" class="btn-sm mt-sm">Save</button>
+      </form>
+      <form method="post" action="/admin/secrets/openai/delete" style="display:inline-block;">
+        <button type="submit" class="btn-danger btn-sm mt-sm">Clear</button>
+      </form>
 
-    <form method="post" action="/admin/secrets/slack/signing">
-      <label for="slack_signing_secret">Set Slack signing secret</label>
-      <input id="slack_signing_secret" name="slack_signing_secret" type="password" />
-      <button type="submit">Save Slack Signing Secret</button>
-    </form>
+      <hr style="border: none; border-top: 1px solid var(--hair); margin: 16px 0;" />
 
-    <form method="post" action="/admin/secrets/slack/signing/delete">
-      <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-        Clear Stored Slack Signing Secret
-      </button>
-    </form>
+      <form method="post" action="/admin/secrets/slack/signing">
+        <label for="slack_signing_secret">Slack signing secret</label>
+        <input id="slack_signing_secret" name="slack_signing_secret" type="password" />
+        <button type="submit" class="btn-sm mt-sm">Save</button>
+      </form>
+      <form method="post" action="/admin/secrets/slack/signing/delete" style="display:inline-block;">
+        <button type="submit" class="btn-danger btn-sm mt-sm">Clear</button>
+      </form>
 
-    <form method="post" action="/admin/secrets/slack/bot">
-      <label for="slack_bot_token">Set Slack bot token</label>
-      <input id="slack_bot_token" name="slack_bot_token" type="password" placeholder="xoxb-..." />
-      <button type="submit">Save Slack Bot Token</button>
-    </form>
+      <hr style="border: none; border-top: 1px solid var(--hair); margin: 16px 0;" />
 
-    <form method="post" action="/admin/secrets/slack/bot/delete">
-      <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-        Clear Stored Slack Bot Token
-      </button>
-    </form>
+      <form method="post" action="/admin/secrets/slack/bot">
+        <label for="slack_bot_token">Slack bot token</label>
+        <input id="slack_bot_token" name="slack_bot_token" type="password" placeholder="xoxb-..." />
+        <button type="submit" class="btn-sm mt-sm">Save</button>
+      </form>
+      <form method="post" action="/admin/secrets/slack/bot/delete" style="display:inline-block;">
+        <button type="submit" class="btn-danger btn-sm mt-sm">Clear</button>
+      </form>
 
-    <form method="post" action="/admin/secrets/telegram/bot">
-      <label for="telegram_bot_token">Set Telegram bot token</label>
-      <input id="telegram_bot_token" name="telegram_bot_token" type="password" placeholder="123456:ABC..." />
-      <button type="submit">Save Telegram Bot Token</button>
-    </form>
+      <hr style="border: none; border-top: 1px solid var(--hair); margin: 16px 0;" />
 
-    <form method="post" action="/admin/secrets/telegram/bot/delete">
-      <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-        Clear Stored Telegram Bot Token
-      </button>
-    </form>
+      <form method="post" action="/admin/secrets/telegram/bot">
+        <label for="telegram_bot_token">Telegram bot token</label>
+        <input id="telegram_bot_token" name="telegram_bot_token" type="password" placeholder="123456:ABC..." />
+        <button type="submit" class="btn-sm mt-sm">Save</button>
+      </form>
+      <form method="post" action="/admin/secrets/telegram/bot/delete" style="display:inline-block;">
+        <button type="submit" class="btn-danger btn-sm mt-sm">Clear</button>
+      </form>
 
-    <form method="post" action="/admin/secrets/telegram/webhook">
-      <label for="telegram_webhook_secret">Set Telegram webhook secret (required)</label>
-      <input id="telegram_webhook_secret" name="telegram_webhook_secret" type="password" placeholder="secret token sent in webhook header" />
-      <button type="submit">Save Telegram Webhook Secret</button>
-    </form>
+      <hr style="border: none; border-top: 1px solid var(--hair); margin: 16px 0;" />
 
-    <form method="post" action="/admin/secrets/telegram/webhook/delete">
-      <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-        Clear Stored Telegram Webhook Secret
-      </button>
-    </form>
+      <form method="post" action="/admin/secrets/telegram/webhook">
+        <label for="telegram_webhook_secret">Telegram webhook secret</label>
+        <input id="telegram_webhook_secret" name="telegram_webhook_secret" type="password" />
+        <button type="submit" class="btn-sm mt-sm">Save</button>
+      </form>
+      <form method="post" action="/admin/secrets/telegram/webhook/delete" style="display:inline-block;">
+        <button type="submit" class="btn-danger btn-sm mt-sm">Clear</button>
+      </form>
 
-    <form method="post" action="/admin/secrets/brave">
-      <label for="brave_search_api_key">Set Brave Search API key</label>
-      <input id="brave_search_api_key" name="brave_search_api_key" type="password" placeholder="BSA-..." />
-      <button type="submit">Save Brave Key</button>
-    </form>
+      <hr style="border: none; border-top: 1px solid var(--hair); margin: 16px 0;" />
 
-    <form method="post" action="/admin/secrets/brave/delete">
-      <button type="submit" style="border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-        Clear Stored Brave Key
-      </button>
-    </form>
+      <form method="post" action="/admin/secrets/brave">
+        <label for="brave_search_api_key">Brave Search API key</label>
+        <input id="brave_search_api_key" name="brave_search_api_key" type="password" placeholder="BSA-..." />
+        <button type="submit" class="btn-sm mt-sm">Save</button>
+      </form>
+      <form method="post" action="/admin/secrets/brave/delete" style="display:inline-block;">
+        <button type="submit" class="btn-danger btn-sm mt-sm">Clear</button>
+      </form>
+    </div>
 
-    <p style="margin:16px 0 0 0; color: var(--muted);">
+    <p class="text-muted mt-md" style="font-size: 12px;">
       Environment variables take precedence over stored secrets.
     </p>
   {% else %}
-    <p style="margin: 0; color: var(--muted);">
+    <p class="text-muted mt-0" style="font-size: 13px;">
       Set <span class="pill">GRAIL_MASTER_KEY</span> to enable storing secrets in SQLite.
-      Otherwise, set these as environment variables in Railway.
+      Otherwise, set these as environment variables.
     </p>
   {% endif %}
-
-  <p style="margin:16px 0 0 0; color: var(--muted);">
-    In read-only mode, Grail will still answer in Slack, but command execution and context writes are disabled.
-  </p>
 {% endblock %}

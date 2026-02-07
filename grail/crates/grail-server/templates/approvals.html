@@ -1,10 +1,9 @@
 {% extends "layout.html" %}
 {% block title %}Grail | Approvals{% endblock %}
 {% block content %}
-  <h2 style="margin:0 0 10px 0; font-weight:700;">Approvals</h2>
-
-  <p style="margin:0 0 12px 0; color: var(--muted);">
-    Pending approvals can also be handled in Slack by replying: <span class="pill">@Grail approve &lt;id&gt;</span>
+  <h2>Approvals</h2>
+  <p class="section-desc">
+    Pending approvals can also be handled in Slack: <span class="pill">@Grail approve &lt;id&gt;</span>
   </p>
 
   <table>
@@ -22,27 +21,21 @@
     <tbody>
       {% for a in approvals %}
         <tr>
-          <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">{{ a.id }}</td>
-          <td style="color: var(--muted);">{{ a.status }}</td>
-          <td style="color: var(--muted);">{{ a.kind }}</td>
-          <td style="color: var(--muted);">{{ a.decision }}</td>
-          <td style="color: var(--muted);">{{ a.created_at }}</td>
-          <td style="max-width: 520px; color: var(--muted);">{{ a.details }}</td>
+          <td style="font-family: var(--font-mono);">{{ a.id }}</td>
+          <td class="text-muted">{{ a.status }}</td>
+          <td class="text-muted">{{ a.kind }}</td>
+          <td class="text-muted">{{ a.decision }}</td>
+          <td class="text-muted" style="white-space: nowrap;">{{ a.created_at }}</td>
+          <td style="max-width: 400px;" class="text-muted">{{ a.details }}</td>
           <td>
             <form method="post" action="/admin/approvals/{{ a.id }}/approve">
-              <button type="submit" style="margin-top:0; padding:6px 10px; font-size:12px;">
-                Approve
-              </button>
+              <button type="submit" class="btn-sm">Approve</button>
             </form>
             <form method="post" action="/admin/approvals/{{ a.id }}/always">
-              <button type="submit" style="margin-top:8px; padding:6px 10px; font-size:12px;">
-                Always
-              </button>
+              <button type="submit" class="btn-sm mt-sm">Always</button>
             </form>
             <form method="post" action="/admin/approvals/{{ a.id }}/deny">
-              <button type="submit" style="margin-top:8px; padding:6px 10px; font-size:12px; border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-                Deny
-              </button>
+              <button type="submit" class="btn-danger btn-sm mt-sm">Deny</button>
             </form>
           </td>
         </tr>
@@ -50,4 +43,3 @@
     </tbody>
   </table>
 {% endblock %}
-

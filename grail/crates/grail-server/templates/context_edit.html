@@ -1,21 +1,20 @@
 {% extends "layout.html" %}
 {% block title %}Grail | Edit Context{% endblock %}
 {% block content %}
-  <h2 style="margin:0 0 10px 0; font-weight:700;">Edit Context File</h2>
-  <p style="margin:0 0 12px 0; color: var(--muted);">
-    Path: <span class="pill">{{ path }}</span>
-    <span style="margin-left: 10px;">({{ bytes }} bytes)</span>
+  <h2>Edit Context File</h2>
+  <p class="section-desc">
+    <span class="pill">{{ path }}</span>
+    <span class="text-muted" style="margin-left: 8px; font-size: 12px;">{{ bytes }} bytes</span>
   </p>
 
   <form method="post" action="/admin/context/edit">
     <input type="hidden" name="path" value="{{ path }}" />
     <label for="content">Content</label>
-    <textarea id="content" name="content" rows="24">{{ content }}</textarea>
+    <textarea id="content" name="content" rows="24" style="font-size: 13px; line-height: 1.6;">{{ content }}</textarea>
     <button type="submit">Save</button>
   </form>
 
-  <p style="margin:16px 0 0 0; color: var(--muted);">
+  <p class="text-muted mt-md" style="font-size: 12px;">
     Tip: the agent entry point is <span class="pill">INDEX.md</span>.
   </p>
 {% endblock %}
-

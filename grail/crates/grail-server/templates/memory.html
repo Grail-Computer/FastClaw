@@ -1,8 +1,8 @@
 {% extends "layout.html" %}
 {% block title %}Grail | Memory{% endblock %}
 {% block content %}
-  <h2 style="margin:0 0 10px 0; font-weight:700;">Memory</h2>
-  <p style="margin:0 0 12px 0; color: var(--muted);">
+  <h2>Memory</h2>
+  <p class="section-desc">
     Sessions are stored per conversation. Clearing a session resets its rolling memory summary and Codex thread mapping.
   </p>
   <table>
@@ -18,16 +18,14 @@
     <tbody>
       {% for s in sessions %}
         <tr>
-          <td style="max-width: 340px;">{{ s.conversation_key }}</td>
-          <td style="max-width: 240px; color: var(--muted);">{{ s.codex_thread_id }}</td>
-          <td style="max-width: 420px; color: var(--muted);">{{ s.memory_summary }}</td>
-          <td style="color: var(--muted);">{{ s.last_used_at }}</td>
+          <td style="max-width: 300px; font-family: var(--font-mono); font-size: 12px;">{{ s.conversation_key }}</td>
+          <td style="max-width: 200px; font-family: var(--font-mono); font-size: 12px;" class="text-muted">{{ s.codex_thread_id }}</td>
+          <td style="max-width: 360px;" class="text-muted">{{ s.memory_summary }}</td>
+          <td class="text-muted" style="white-space: nowrap;">{{ s.last_used_at }}</td>
           <td>
             <form method="post" action="/admin/memory/clear">
               <input type="hidden" name="conversation_key" value="{{ s.conversation_key }}" />
-              <button type="submit" style="margin-top:0; padding:6px 10px; font-size:12px; border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-                Clear
-              </button>
+              <button type="submit" class="btn-danger btn-sm">Clear</button>
             </form>
           </td>
         </tr>
@@ -35,4 +33,3 @@
     </tbody>
   </table>
 {% endblock %}
-

@@ -1,7 +1,8 @@
 {% extends "layout.html" %}
 {% block title %}Grail | Queue{% endblock %}
 {% block content %}
-  <h2 style="margin:0 0 10px 0; font-weight:700;">Queue</h2>
+  <h2>Queue</h2>
+  <p class="section-desc">Recent and pending tasks. Most recent first.</p>
   <table>
     <thead>
       <tr>
@@ -9,7 +10,7 @@
         <th>Status</th>
         <th>Provider</th>
         <th>Channel</th>
-        <th>Thread TS</th>
+        <th>Thread</th>
         <th>Prompt</th>
         <th>Result / Error</th>
         <th>Created</th>
@@ -19,35 +20,40 @@
     <tbody>
       {% for t in tasks %}
         <tr>
-          <td>{{ t.id }}</td>
-          <td>{{ t.status }}</td>
-          <td>{{ t.provider }}</td>
-          <td>{{ t.channel_id }}</td>
-          <td>{{ t.thread_ts }}</td>
-          <td style="max-width: 420px; color: var(--muted);">{{ t.prompt_text }}</td>
-          <td style="max-width: 420px; color: var(--muted);">
-            {% if t.result_text != "" %}
-              {{ t.result_text }}
-            {% endif %}
-            {% if t.error_text != "" %}
-              <span style="color: rgba(255,107,107,0.95);">{{ t.error_text }}</span>
+          <td style="font-family: var(--font-mono);">{{ t.id }}</td>
+          <td>
+            {% if t.status == "done" %}
+              <span class="pill ok">{{ t.status }}</span>
+            {% elif t.status == "failed" %}
+              <span class="pill bad">{{ t.status }}</span>
+            {% elif t.status == "running" %}
+              <span class="pill ok">{{ t.status }}</span>
+            {% else %}
+              <span class="pill">{{ t.status }}</span>
             {% endif %}
           </td>
-          <td style="color: var(--muted);">{{ t.created_at }}</td>
+          <td class="text-muted">{{ t.provider }}</td>
+          <td style="font-family: var(--font-mono); font-size: 12px;" class="text-muted">{{ t.channel_id }}</td>
+          <td style="font-family: var(--font-mono); font-size: 12px;" class="text-muted">{{ t.thread_ts }}</td>
+          <td style="max-width: 340px;" class="text-muted">{{ t.prompt_text }}</td>
+          <td style="max-width: 340px;">
+            {% if t.result_text != "" %}
+              <span class="text-muted">{{ t.result_text }}</span>
+            {% endif %}
+            {% if t.error_text != "" %}
+              <span class="text-danger">{{ t.error_text }}</span>
+            {% endif %}
+          </td>
+          <td class="text-muted" style="white-space: nowrap;">{{ t.created_at }}</td>
           <td>
             {% if t.status == "queued" %}
               <form method="post" action="/admin/tasks/{{ t.id }}/cancel">
-                <button type="submit" style="margin-top:0; padding:6px 10px; font-size:12px; border-color: rgba(255,107,107,0.35); background: rgba(255,107,107,0.10); color: rgba(255,107,107,0.95);">
-                  Cancel
-                </button>
+                <button type="submit" class="btn-danger btn-sm">Cancel</button>
               </form>
             {% endif %}
-
             {% if t.status == "failed" || t.status == "cancelled" %}
               <form method="post" action="/admin/tasks/{{ t.id }}/retry">
-                <button type="submit" style="margin-top:8px; padding:6px 10px; font-size:12px;">
-                  Retry
-                </button>
+                <button type="submit" class="btn-sm">Retry</button>
               </form>
             {% endif %}
           </td>
