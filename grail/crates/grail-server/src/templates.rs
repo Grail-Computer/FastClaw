@@ -12,6 +12,7 @@ pub struct StatusTemplate {
     pub master_key_set: bool,
     pub queue_depth: i64,
     pub permissions_mode: String,
+    pub slack_events_url: String,
 }
 
 #[derive(Template)]

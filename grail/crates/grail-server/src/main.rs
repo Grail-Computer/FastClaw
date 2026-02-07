@@ -362,6 +362,13 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Html<String>> 
         .await?
         .get::<i64, _>("c");
 
+    let slack_events_url = state
+        .config
+        .base_url
+        .as_deref()
+        .map(|b| format!("{}/slack/events", b.trim_end_matches('/')))
+        .unwrap_or_else(|| "/slack/events".to_string());
+
     let tpl = StatusTemplate {
         active: "status",
         slack_signing_secret_set: state.config.slack_signing_secret.is_some(),
@@ -370,6 +377,7 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Html<String>> 
         master_key_set: state.crypto.is_some(),
         queue_depth,
         permissions_mode: settings.permissions_mode.as_db_str().to_string(),
+        slack_events_url,
     };
     Ok(Html(tpl.render()?))
 }

@@ -28,6 +28,7 @@ Note: the `Dockerfile` downloads a pinned Codex release (`CODEX_VERSION` build a
    - `SLACK_BOT_TOKEN` (required)
    - `OPENAI_API_KEY` (recommended)
    - `GRAIL_MASTER_KEY` (optional; required only if you want to set the OpenAI key via the dashboard and store it encrypted). Generate with: `openssl rand -hex 32`
+   - `BASE_URL` (optional; used only to render full URLs in the dashboard, e.g. the Slack events URL)
 4. Deploy.
 
 After deploy:
