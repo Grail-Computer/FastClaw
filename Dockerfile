@@ -1,3 +1,13 @@
+# ── Stage 1: Build React frontend ──────────────────────────────────────
+FROM node:22-slim AS frontend-builder
+
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm ci --ignore-scripts 2>/dev/null || npm install
+COPY frontend/ .
+RUN npx vite build
+
+# ── Stage 2: Build Rust backend ────────────────────────────────────────
 FROM rust:1.88-slim-bookworm AS builder
 
 WORKDIR /app
@@ -14,7 +24,7 @@ COPY grail /app/grail
 WORKDIR /app/grail
 RUN cargo build --release -p grail-server -p grail-slack-mcp -p grail-web-mcp
 
-
+# ── Stage 3: Runtime ───────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,14 +38,17 @@ COPY --from=builder /app/grail/target/release/grail-server /usr/local/bin/grail-
 COPY --from=builder /app/grail/target/release/grail-slack-mcp /usr/local/bin/grail-slack-mcp
 COPY --from=builder /app/grail/target/release/grail-web-mcp /usr/local/bin/grail-web-mcp
 
+# Copy the built React SPA into the runtime image.
+COPY --from=frontend-builder /app/frontend/dist /app/frontend-dist
+
 # Install Codex CLI (Linux x86_64 musl) from GitHub releases.
 ARG CODEX_VERSION=rust-v0.98.0
 ARG TARGETARCH
 RUN set -eux; \
     case "${TARGETARCH}" in \
-      amd64) COD_ARCH="x86_64" ;; \
-      arm64) COD_ARCH="aarch64" ;; \
-      *) echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    amd64) COD_ARCH="x86_64" ;; \
+    arm64) COD_ARCH="aarch64" ;; \
+    *) echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/openai/codex/releases/download/${CODEX_VERSION}/codex-${COD_ARCH}-unknown-linux-musl.tar.gz" -o /tmp/codex.tgz; \
     tar -xzf /tmp/codex.tgz -C /tmp; \
@@ -46,6 +59,7 @@ RUN set -eux; \
 ENV GRAIL_DATA_DIR=/data
 ENV CODEX_HOME=/data/codex
 ENV CODEX_BIN=/usr/local/bin/codex
+ENV GRAIL_FRONTEND_DIR=/app/frontend-dist
 
 RUN useradd -m -u 10001 -s /bin/bash app
 
@@ -54,3 +68,4 @@ RUN chmod +x /entrypoint.sh
 
 EXPOSE 3000
 ENTRYPOINT ["/entrypoint.sh"]
+

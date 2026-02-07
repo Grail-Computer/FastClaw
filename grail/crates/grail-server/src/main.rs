@@ -1,3 +1,4 @@
+mod api;
 mod approvals;
 mod bootstrap;
 mod codex;
@@ -205,6 +206,54 @@ async fn main() -> anyhow::Result<()> {
             admin_basic_auth,
         ));
 
+    let api_routes = Router::new()
+        .route("/status", get(api::api_status))
+        .route(
+            "/settings",
+            get(api::api_settings_get).post(api::api_settings_post),
+        )
+        .route(
+            "/secrets/{key}",
+            post(api::api_set_secret).delete(api::api_delete_secret),
+        )
+        .route("/tasks", get(api::api_tasks))
+        .route("/tasks/{id}/cancel", post(api::api_task_cancel))
+        .route("/tasks/{id}/retry", post(api::api_task_retry))
+        .route("/memory", get(api::api_memory))
+        .route("/memory/clear", post(api::api_memory_clear))
+        .route("/context", get(api::api_context_list))
+        .route(
+            "/context/file",
+            get(api::api_context_file_get).post(api::api_context_file_post),
+        )
+        .route("/cron", get(api::api_cron_list))
+        .route("/cron/add", post(api::api_cron_add))
+        .route("/cron/{id}/delete", post(api::api_cron_delete))
+        .route("/cron/{id}/enable", post(api::api_cron_enable))
+        .route("/cron/{id}/disable", post(api::api_cron_disable))
+        .route("/guardrails", get(api::api_guardrails_list))
+        .route("/guardrails/add", post(api::api_guardrails_add))
+        .route("/guardrails/{id}/delete", post(api::api_guardrails_delete))
+        .route("/guardrails/{id}/enable", post(api::api_guardrails_enable))
+        .route(
+            "/guardrails/{id}/disable",
+            post(api::api_guardrails_disable),
+        )
+        .route("/approvals", get(api::api_approvals_list))
+        .route("/approvals/{id}/approve", post(api::api_approval_approve))
+        .route("/approvals/{id}/always", post(api::api_approval_always))
+        .route("/approvals/{id}/deny", post(api::api_approval_deny))
+        .route("/auth", get(api::api_auth_get))
+        .route("/auth/device/start", post(api::api_auth_device_start))
+        .route("/auth/device/cancel", post(api::api_auth_device_cancel))
+        .route("/auth/logout", post(api::api_auth_logout))
+        .route("/diagnostics", get(api::api_diagnostics))
+        .route("/diagnostics/codex", post(api::api_diagnostics_codex))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_basic_auth,
+        ));
+
     let app = Router::new()
         .route("/", get(|| async { Redirect::to("/admin/status") }))
         .route("/healthz", get(healthz))
@@ -212,6 +261,32 @@ async fn main() -> anyhow::Result<()> {
         .route("/slack/actions", post(slack_actions))
         .route("/telegram/webhook", post(telegram_webhook))
         .nest("/admin", admin)
+        .nest("/api/admin", api_routes);
+
+    // If frontend-dist dir exists, serve the SPA from it as fallback.
+    let frontend_dir = state
+        .config
+        .data_dir
+        .parent()
+        .unwrap_or(&state.config.data_dir)
+        .join("frontend-dist");
+    let frontend_dir_env = std::env::var("GRAIL_FRONTEND_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or(frontend_dir);
+
+    let app = if frontend_dir_env.join("index.html").exists() {
+        info!(dir = %frontend_dir_env.display(), "serving React SPA from frontend-dist");
+        let serve_dir = tower_http::services::ServeDir::new(&frontend_dir_env).not_found_service(
+            tower_http::services::ServeFile::new(frontend_dir_env.join("index.html")),
+        );
+        app.fallback_service(serve_dir)
+    } else {
+        info!("frontend-dist not found; SPA fallback disabled");
+        app
+    };
+
+    let app = app
         .with_state(state)
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(TraceLayer::new_for_http());
@@ -2253,14 +2328,14 @@ fn thread_opt(thread_ts: &str) -> Option<&str> {
     }
 }
 
-fn random_id(prefix: &str) -> String {
+pub fn random_id(prefix: &str) -> String {
     let mut bytes = [0u8; 16];
     let mut rng = rand::rng();
     rand::RngCore::fill_bytes(&mut rng, &mut bytes);
     format!("{}_{}", prefix, hex::encode(bytes))
 }
 
-async fn run_device_login_flow(
+pub async fn run_device_login_flow(
     pool: SqlitePool,
     login_id: String,
     codex_home: std::path::PathBuf,
@@ -2380,7 +2455,7 @@ fn clamp_chars(s: String, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-async fn list_context_files(
+pub async fn list_context_files(
     root: &std::path::Path,
 ) -> anyhow::Result<Vec<crate::templates::ContextFileRow>> {
     let mut out: Vec<crate::templates::ContextFileRow> = Vec::new();
@@ -2427,7 +2502,7 @@ async fn list_context_files(
     Ok(out)
 }
 
-fn sanitize_rel_path(path: &str) -> anyhow::Result<std::path::PathBuf> {
+pub fn sanitize_rel_path(path: &str) -> anyhow::Result<std::path::PathBuf> {
     let p = std::path::PathBuf::from(path.trim());
     anyhow::ensure!(!p.as_os_str().is_empty(), "empty path");
     anyhow::ensure!(!p.is_absolute(), "absolute paths are not allowed");
@@ -2440,7 +2515,7 @@ fn sanitize_rel_path(path: &str) -> anyhow::Result<std::path::PathBuf> {
     Ok(p)
 }
 
-async fn resolve_under_root_no_symlinks(
+pub async fn resolve_under_root_no_symlinks(
     root: &std::path::Path,
     rel: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {

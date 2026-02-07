@@ -19,3 +19,4 @@ codex/
 nanobot/
 coworker/
 guardrails/
+frontend/node_modules/*
