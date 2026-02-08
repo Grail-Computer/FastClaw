@@ -86,3 +86,4 @@ INSERT INTO guardrail_rules (id, name, kind, pattern_kind, pattern, action, prio
 INSERT INTO guardrail_rules (id, name, kind, pattern_kind, pattern, action, priority, enabled, created_at, updated_at)
   VALUES ('cmd_req_approval_shell_c', 'shell -c', 'command', 'regex', '(?i)\\b(bash|sh|zsh)\\b\\s+-c\\b', 'require_approval', 15, 1, unixepoch(), unixepoch())
   ON CONFLICT(id) DO NOTHING;
+
