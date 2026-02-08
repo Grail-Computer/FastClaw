@@ -1,4 +1,4 @@
-# Grail (MicroEmployee)
+# Grail the μEmployee
 
 Grail is a single-tenant “micro employee” you deploy as a service and connect to Slack and/or Telegram.
 
@@ -9,6 +9,7 @@ In Slack, you can mention it:
 In Telegram (DM or group), you can address it via `/grail ...` (or @mention in groups).
 
 Grail will:
+
 - Acknowledge quickly (queues a job).
 - Inject the last **N** recent messages as context (configurable).
 - Work through tasks **one-at-a-time** from a SQLite-backed queue.
@@ -41,6 +42,7 @@ Note: the `Dockerfile` downloads a pinned Codex release (`CODEX_VERSION` build a
 4. Deploy.
 
 After deploy:
+
 - Slack events endpoint is `POST /slack/events`
 - Slack interactive endpoint is `POST /slack/actions` (optional, for approval buttons)
 - Telegram webhook endpoint is `POST /telegram/webhook`
@@ -79,6 +81,7 @@ Telegram history note: the Bot API can’t fetch arbitrary chat history, so Grai
 ## Dashboard
 
 `/admin/settings` lets you configure:
+
 - Slack context size (last N messages)
 - model + reasoning knobs
 - permissions mode (`read` vs `full`)
@@ -110,6 +113,7 @@ Telegram secrets can also be stored the same way.
 Mount a volume at `/data`.
 
 Grail stores:
+
 - `/data/grail.sqlite` (queue, settings, session mapping)
 - `/data/context/` (durable notes)
 - `/data/context/AGENTS.md` (default instruction “constitution” for the agent)
@@ -125,6 +129,7 @@ Even in `read`, Grail can respond and (optionally) use Slack MCP tools to fetch 
 ## Local Development
 
 You’ll need:
+
 - Rust toolchain
 - `codex` on your PATH (or set `CODEX_BIN`)
 - Slack + OpenAI credentials
