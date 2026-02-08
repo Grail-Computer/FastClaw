@@ -604,7 +604,7 @@ async fn spawn_codex_with_args(
             json!({
                 "clientInfo": {
                     "name": "grail",
-                    "title": "Grail MicroEmployee",
+                    "title": "MicroEmployee",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "capabilities": null

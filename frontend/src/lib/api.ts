@@ -109,6 +109,8 @@ export interface SettingsData {
   permissions_mode: string;
   slack_allow_from: string;
   slack_allow_channels: string;
+  slack_proactive_enabled: boolean;
+  slack_proactive_snippet: string;
   allow_telegram: boolean;
   telegram_allow_from: string;
   allow_slack_mcp: boolean;
@@ -138,6 +140,7 @@ export interface TaskData {
   id: number;
   status: string;
   provider: string;
+  is_proactive: boolean;
   channel_id: string;
   thread_ts: string;
   prompt_text: string;

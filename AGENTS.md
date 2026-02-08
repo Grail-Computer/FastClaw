@@ -1,8 +1,8 @@
-# AGENTS.md — MicroEmployee (Grail)
+# AGENTS.md — MicroEmployee
 
 ## What This Is
 
-Grail is a **Slack/Telegram bot** backed by an autonomous AI agent (OpenAI Codex CLI). It receives messages from Slack or Telegram, queues them as tasks in a SQLite database, runs Codex in a sandboxed subprocess to produce answers, and posts the results back. It ships with an admin dashboard for configuration, monitoring, and approvals.
+MicroEmployee is a **Slack/Telegram bot** backed by an autonomous AI agent (OpenAI Codex CLI). It receives messages from Slack or Telegram, queues them as tasks in a SQLite database, runs Codex in a sandboxed subprocess to produce answers, and posts the results back. It ships with an admin dashboard for configuration, monitoring, and approvals.
 
 **Production deployment**: Railway (Docker).
 
@@ -80,7 +80,7 @@ All templates use Askama and extend `layout.html` (base layout with nav + CSS).
 
 ## Database (SQLite)
 
-- **Location**: `$GRAIL_DATA_DIR/grail.db` (default `/data/grail.db`)
+- **Location**: `$GRAIL_DATA_DIR/grail.sqlite` (default `/data/grail.sqlite`)
 - **Migrations**: `grail/crates/grail-server/migrations/` — auto-applied on startup via `sqlx::migrate!()`
 - **Key tables**: `settings`, `tasks`, `sessions`, `cron_jobs`, `guardrail_rules`, `approvals`, `secrets`
 

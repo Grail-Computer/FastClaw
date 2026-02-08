@@ -88,6 +88,7 @@ struct AppState {
     pool: SqlitePool,
     http: reqwest::Client,
     crypto: Option<Arc<Crypto>>,
+    slack_bot_user_id: Arc<RwLock<Option<String>>>,
     telegram_bot_username: Arc<RwLock<Option<String>>>,
 }
 
@@ -124,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
                     None
                 }
             }),
+        slack_bot_user_id: Arc::new(RwLock::new(None)),
         telegram_bot_username: Arc::new(RwLock::new(None)),
     };
 
@@ -333,7 +335,7 @@ fn unauthorized_basic() -> Response {
     let mut resp = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     resp.headers_mut().insert(
         axum::http::header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Basic realm=\"Grail\""),
+        HeaderValue::from_static("Basic realm=\"MicroEmployee\""),
     );
     resp
 }
@@ -613,6 +615,8 @@ async fn admin_settings_get(State(state): State<AppState>) -> AppResult<Html<Str
         permissions_mode: settings.permissions_mode.as_db_str().to_string(),
         slack_allow_from: settings.slack_allow_from,
         slack_allow_channels: settings.slack_allow_channels,
+        slack_proactive_enabled: settings.slack_proactive_enabled,
+        slack_proactive_snippet: settings.slack_proactive_snippet,
         allow_telegram: settings.allow_telegram,
         telegram_allow_from: settings.telegram_allow_from,
         allow_slack_mcp: settings.allow_slack_mcp,
@@ -648,6 +652,8 @@ struct SettingsForm {
     permissions_mode: String,
     slack_allow_from: String,
     slack_allow_channels: String,
+    slack_proactive_enabled: Option<String>,
+    slack_proactive_snippet: String,
     allow_telegram: Option<String>,
     telegram_allow_from: String,
     allow_slack_mcp: Option<String>,
@@ -686,6 +692,9 @@ async fn admin_settings_post(
     // Optional channel allow list (C/G IDs).
     settings.slack_allow_channels =
         clamp_chars(form.slack_allow_channels.trim().to_string(), 2_000);
+    settings.slack_proactive_enabled = form.slack_proactive_enabled.is_some();
+    settings.slack_proactive_snippet =
+        clamp_chars(form.slack_proactive_snippet.trim().to_string(), 8_000);
 
     settings.allow_telegram = form.allow_telegram.is_some();
     // Comma/whitespace/newline separated Telegram user IDs (integers).
@@ -702,7 +711,7 @@ async fn admin_settings_post(
     settings.agent_name = {
         let v = clamp_chars(form.agent_name.trim().to_string(), 48);
         if v.is_empty() {
-            "Grail".to_string()
+            "μEmployee".to_string()
         } else {
             v
         }
@@ -1209,6 +1218,7 @@ async fn run_codex_self_test(state: &AppState) -> anyhow::Result<String> {
         id: 0,
         status: "diagnostic".to_string(),
         provider: "admin".to_string(),
+        is_proactive: false,
         workspace_id: "admin".to_string(),
         channel_id: "admin".to_string(),
         thread_ts: "".to_string(),
@@ -1226,9 +1236,11 @@ async fn run_codex_self_test(state: &AppState) -> anyhow::Result<String> {
     let input_text = r#"Diagnostics: return ONLY a single JSON object that matches the schema.
 
 Set:
+- should_reply: true
 - reply: "ok"
 - updated_memory_summary: ""
 - context_writes: []
+- upload_files: []
 - cron_jobs: []
 - guardrail_rules: []
 
@@ -1287,7 +1299,7 @@ async fn admin_cron_add(
         .filter(|s| !s.is_empty())
     else {
         return Err(anyhow::anyhow!(
-            "workspace_id is not set yet. Mention Grail once in Slack so it can pin the workspace id."
+            "workspace_id is not set yet. Mention μEmployee once in Slack so it can pin the workspace id."
         )
         .into());
     };
@@ -1631,7 +1643,19 @@ async fn slack_events(
             event_id,
             event,
         } => {
-            let (user, text, ts, channel, thread_ts, is_dm, files) = match event {
+            let (
+                user,
+                text,
+                ts,
+                channel,
+                thread_ts,
+                is_dm,
+                is_proactive,
+                strip_mentions,
+                should_post_ack,
+                allow_approval_commands,
+                files,
+            ) = match event {
                 SlackEvent::AppMention {
                     user,
                     text,
@@ -1641,26 +1665,23 @@ async fn slack_events(
                     files,
                 } => {
                     let thread_ts = thread_ts.unwrap_or_else(|| ts.clone());
-                    (user, text, ts, channel, thread_ts, false, files)
+                    (
+                        user, text, ts, channel, thread_ts, false, false, true, true, true, files,
+                    )
                 }
                 SlackEvent::Message {
                     user,
                     text,
                     ts,
                     channel,
+                    thread_ts,
                     channel_type,
                     subtype,
                     bot_id,
                     files,
                     ..
                 } => {
-                    // Only handle direct messages (IMs and multi-person IMs).
-                    // Channel traffic should go through app_mention to avoid responding
-                    // to every message.
                     let ct = channel_type.as_deref().unwrap_or("");
-                    if ct != "im" && ct != "mpim" {
-                        return (StatusCode::OK, "").into_response();
-                    }
                     // Ignore bot messages and non-user subtypes to avoid loops.
                     if bot_id.is_some() || subtype.is_some() {
                         return (StatusCode::OK, "").into_response();
@@ -1669,8 +1690,32 @@ async fn slack_events(
                         return (StatusCode::OK, "").into_response();
                     };
                     let text = text.unwrap_or_default();
-                    // In DMs, reply in-channel (no thread).
-                    (user, text, ts, channel, String::new(), true, files)
+                    if ct == "im" || ct == "mpim" {
+                        // In DMs, reply in-channel (no thread).
+                        (
+                            user,
+                            text,
+                            ts,
+                            channel,
+                            String::new(),
+                            true,
+                            false,
+                            false,
+                            true,
+                            true,
+                            files,
+                        )
+                    } else if ct == "channel" || ct == "group" {
+                        // Proactive mode: see all channel/group messages and decide whether to reply.
+                        // We'll still enforce settings below.
+                        let thread_ts = thread_ts.unwrap_or_else(|| ts.clone());
+                        (
+                            user, text, ts, channel, thread_ts, false, true, false, false, false,
+                            files,
+                        )
+                    } else {
+                        return (StatusCode::OK, "").into_response();
+                    }
                 }
                 _ => return (StatusCode::OK, "").into_response(),
             };
@@ -1678,6 +1723,10 @@ async fn slack_events(
             // Enforce single-workspace per deployment.
             match db::get_settings(&state.pool).await {
                 Ok(settings) => {
+                    if is_proactive && !settings.slack_proactive_enabled {
+                        return (StatusCode::OK, "").into_response();
+                    }
+
                     if let Some(want) = settings
                         .workspace_id
                         .as_deref()
@@ -1697,14 +1746,17 @@ async fn slack_events(
                     let allowed = parse_allow_from(&settings.slack_allow_from);
                     if !allowed.is_empty() && !allowed.contains(user.as_str()) {
                         warn!(user = %user, "slack user not in allow list; ignoring");
-                        if let Ok(Some(token)) =
-                            crate::secrets::load_slack_bot_token_opt(&state).await
-                        {
-                            let slack = SlackClient::new(state.http.clone(), token);
-                            let msg = "Sorry, you're not authorized to use this Grail instance.";
-                            let _ = slack
-                                .post_message(&channel, thread_opt(&thread_ts), msg)
-                                .await;
+                        if !is_proactive {
+                            if let Ok(Some(token)) =
+                                crate::secrets::load_slack_bot_token_opt(&state).await
+                            {
+                                let slack = SlackClient::new(state.http.clone(), token);
+                                let msg =
+                                    "Sorry, you're not authorized to use this MicroEmployee instance.";
+                                let _ = slack
+                                    .post_message(&channel, thread_opt(&thread_ts), msg)
+                                    .await;
+                            }
                         }
                         return (StatusCode::OK, "").into_response();
                     }
@@ -1714,22 +1766,45 @@ async fn slack_events(
                         let channels = parse_allow_from(&settings.slack_allow_channels);
                         if !channels.is_empty() && !channels.contains(channel.as_str()) {
                             warn!(channel = %channel, "slack channel not in allow list; ignoring");
-                            if let Ok(Some(token)) =
-                                crate::secrets::load_slack_bot_token_opt(&state).await
-                            {
-                                let slack = SlackClient::new(state.http.clone(), token);
-                                let msg =
-                                    "Sorry, this Grail instance isn't enabled in this channel.";
-                                let _ = slack
-                                    .post_message(&channel, thread_opt(&thread_ts), msg)
-                                    .await;
+                            if !is_proactive {
+                                if let Ok(Some(token)) =
+                                    crate::secrets::load_slack_bot_token_opt(&state).await
+                                {
+                                    let slack = SlackClient::new(state.http.clone(), token);
+                                    let msg = "Sorry, this MicroEmployee instance isn't enabled in this channel.";
+                                    let _ = slack
+                                        .post_message(&channel, thread_opt(&thread_ts), msg)
+                                        .await;
+                                }
                             }
                             return (StatusCode::OK, "").into_response();
                         }
                     }
                 }
                 Err(err) => {
-                    warn!(error = %err, "failed to load settings for slack authz; allowing event");
+                    warn!(error = %err, "failed to load settings for slack authz");
+                    if is_proactive {
+                        return (StatusCode::OK, "").into_response();
+                    }
+                }
+            }
+
+            // If this proactive message explicitly mentions the bot, let the app_mention
+            // event handle it so we don't double-enqueue and double-reply.
+            if is_proactive {
+                if let Ok(Some(token)) = crate::secrets::load_slack_bot_token_opt(&state).await {
+                    match slack_bot_user_id_cached(&state, &token).await {
+                        Ok(Some(bot_user_id)) => {
+                            let needle = format!("<@{}", bot_user_id);
+                            if text.contains(&needle) {
+                                return (StatusCode::OK, "").into_response();
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(error = %err, "failed to resolve slack bot user id");
+                        }
+                    }
                 }
             }
 
@@ -1746,31 +1821,37 @@ async fn slack_events(
                 return (StatusCode::OK, "").into_response();
             }
 
-            let mut prompt = if is_dm {
-                clamp_chars(text.trim().to_string(), 4_000)
-            } else {
-                clamp_chars(strip_leading_mentions(&text), 4_000)
-            };
+            let mut prompt = clamp_chars(
+                if strip_mentions {
+                    strip_leading_mentions(&text)
+                } else {
+                    text.trim().to_string()
+                },
+                4_000,
+            );
 
-            if let Some((action, approval_id)) = parse_approval_command(&prompt) {
-                match crate::approvals::handle_approval_command(&state, action, &approval_id).await
-                {
-                    Ok(Some(msg)) => {
-                        if let Ok(Some(token)) =
-                            crate::secrets::load_slack_bot_token_opt(&state).await
-                        {
-                            let slack = SlackClient::new(state.http.clone(), token);
-                            let _ = slack
-                                .post_message(&channel, thread_opt(&thread_ts), msg.trim())
-                                .await;
+            if allow_approval_commands {
+                if let Some((action, approval_id)) = parse_approval_command(&prompt) {
+                    match crate::approvals::handle_approval_command(&state, action, &approval_id)
+                        .await
+                    {
+                        Ok(Some(msg)) => {
+                            if let Ok(Some(token)) =
+                                crate::secrets::load_slack_bot_token_opt(&state).await
+                            {
+                                let slack = SlackClient::new(state.http.clone(), token);
+                                let _ = slack
+                                    .post_message(&channel, thread_opt(&thread_ts), msg.trim())
+                                    .await;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(error = %err, "failed to handle approval command");
                         }
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(error = %err, "failed to handle approval command");
-                    }
+                    return (StatusCode::OK, "").into_response();
                 }
-                return (StatusCode::OK, "").into_response();
             }
 
             // --- File handling ---
@@ -1838,6 +1919,7 @@ async fn slack_events(
                 &user,
                 &prompt,
                 &files_json,
+                is_proactive,
             )
             .await
             {
@@ -1848,24 +1930,26 @@ async fn slack_events(
                 }
             };
 
-            // Ack immediately, post "Queued" asynchronously.
-            match crate::secrets::load_slack_bot_token_opt(&state).await {
-                Ok(Some(token)) => {
-                    let slack = SlackClient::new(state.http.clone(), token);
-                    let queued_text = format!("Queued as #{task_id}. I'll start soon.");
-                    let thread_ts = thread_ts.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = slack
-                            .post_message(&channel, thread_opt(&thread_ts), &queued_text)
-                            .await
-                        {
-                            warn!(error = %err, "failed to post queued message");
-                        }
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(error = %err, "failed to load slack bot token");
+            // Ack immediately, post "Queued" asynchronously (but never for proactive messages).
+            if should_post_ack {
+                match crate::secrets::load_slack_bot_token_opt(&state).await {
+                    Ok(Some(token)) => {
+                        let slack = SlackClient::new(state.http.clone(), token);
+                        let queued_text = format!("Queued as #{task_id}. I'll start soon.");
+                        let thread_ts = thread_ts.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = slack
+                                .post_message(&channel, thread_opt(&thread_ts), &queued_text)
+                                .await
+                            {
+                                warn!(error = %err, "failed to post queued message");
+                            }
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = %err, "failed to load slack bot token");
+                    }
                 }
             }
 
@@ -2194,9 +2278,11 @@ async fn telegram_webhook(
     } else if let Some(user) = bot_username.as_deref() {
         text.contains(&format!("@{user}"))
             || text.starts_with("/grail")
+            || text.starts_with("/microemployee")
             || text.starts_with(&format!("/grail@{user}"))
+            || text.starts_with(&format!("/microemployee@{user}"))
     } else {
-        text.starts_with("/grail")
+        text.starts_with("/grail") || text.starts_with("/microemployee")
     };
 
     if !directed {
@@ -2240,6 +2326,25 @@ async fn telegram_webhook(
     (StatusCode::OK, "").into_response()
 }
 
+async fn slack_bot_user_id_cached(
+    state: &AppState,
+    bot_token: &str,
+) -> anyhow::Result<Option<String>> {
+    {
+        let guard = state.slack_bot_user_id.read().await;
+        if let Some(v) = guard.clone() {
+            return Ok(Some(v));
+        }
+    }
+
+    let slack = SlackClient::new(state.http.clone(), bot_token.to_string());
+    let user_id = slack.auth_test_bot_user_id().await?;
+
+    let mut guard = state.slack_bot_user_id.write().await;
+    *guard = Some(user_id.clone());
+    Ok(Some(user_id))
+}
+
 async fn telegram_bot_username_cached(
     state: &AppState,
     bot_token: &str,
@@ -2269,7 +2374,10 @@ fn clean_telegram_prompt(text: &str, bot_username: Option<&str>) -> String {
         let mut parts = t.split_whitespace();
         let first = parts.next().unwrap_or("");
         let first = first.trim();
-        if first.starts_with("/grail") || first.starts_with("/start") {
+        if first.starts_with("/grail")
+            || first.starts_with("/microemployee")
+            || first.starts_with("/start")
+        {
             t = parts.collect::<Vec<_>>().join(" ").trim().to_string();
         }
     }

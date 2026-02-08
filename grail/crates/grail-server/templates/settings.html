@@ -1,5 +1,5 @@
 {% extends "layout.html" %}
-{% block title %}Grail | Settings{% endblock %}
+{% block title %}MicroEmployee | Settings{% endblock %}
 {% block content %}
   <h2>Settings</h2>
   <p class="section-desc">Configure the agent's identity, permissions, and integrations.</p>
@@ -74,6 +74,16 @@
 
     <label for="slack_allow_channels">Channel allow list</label>
     <input id="slack_allow_channels" name="slack_allow_channels" type="text" placeholder="Comma-separated channel IDs; DMs always allowed" value="{{ slack_allow_channels }}" />
+
+    <div style="display:flex; align-items:center; gap:10px; margin-top:14px;">
+      <input id="slack_proactive_enabled" name="slack_proactive_enabled" type="checkbox" value="1" {% if slack_proactive_enabled %}checked{% endif %} style="width:auto;" />
+      <label for="slack_proactive_enabled" style="margin:0; color: var(--text);">Proactive mode (listen to channel messages without @mention)</label>
+    </div>
+    <label for="slack_proactive_snippet" style="margin-top: 10px;">Proactive relevance snippet</label>
+    <textarea id="slack_proactive_snippet" name="slack_proactive_snippet" rows="4" placeholder="Example: Reply only when someone asks for help with deployments, incidents, CI failures, or when action items are mentioned. Otherwise ignore.">{{ slack_proactive_snippet }}</textarea>
+    <p class="text-muted mt-sm" style="font-size: 12px;">
+      Tip: also set a channel allow list to avoid scanning your whole workspace. You must subscribe to <span class="pill">message.channels</span> / <span class="pill">message.groups</span> events in the Slack app manifest for this to work.
+    </p>
 
     <div style="display:flex; align-items:center; gap:10px; margin-top:14px;">
       <input id="allow_slack_mcp" name="allow_slack_mcp" type="checkbox" value="1" {% if allow_slack_mcp %}checked{% endif %} style="width:auto;" />

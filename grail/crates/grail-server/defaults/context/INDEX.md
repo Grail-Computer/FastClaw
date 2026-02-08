@@ -1,10 +1,9 @@
-# Grail Context Index
+# MicroEmployee Context Index
 
-This folder is durable, long-lived memory for Grail.
+This folder is durable, long-lived memory for MicroEmployee.
 
 Add one line per document, with a short label and the relative path.
 
 Examples:
 - Company glossary: glossary.md
 - On-call playbook: oncall.md
-

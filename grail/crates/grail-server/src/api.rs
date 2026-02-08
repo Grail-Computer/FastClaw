@@ -80,6 +80,8 @@ pub async fn api_settings_get(State(state): State<AppState>) -> ApiResult<Value>
         "permissions_mode": s.permissions_mode.as_db_str(),
         "slack_allow_from": s.slack_allow_from,
         "slack_allow_channels": s.slack_allow_channels,
+        "slack_proactive_enabled": s.slack_proactive_enabled,
+        "slack_proactive_snippet": s.slack_proactive_snippet,
         "allow_telegram": s.allow_telegram,
         "telegram_allow_from": s.telegram_allow_from,
         "allow_slack_mcp": s.allow_slack_mcp,
@@ -114,6 +116,8 @@ pub struct ApiSettingsPost {
     pub permissions_mode: Option<String>,
     pub slack_allow_from: Option<String>,
     pub slack_allow_channels: Option<String>,
+    pub slack_proactive_enabled: Option<bool>,
+    pub slack_proactive_snippet: Option<String>,
     pub allow_telegram: Option<bool>,
     pub telegram_allow_from: Option<String>,
     pub allow_slack_mcp: Option<bool>,
@@ -160,6 +164,12 @@ pub async fn api_settings_post(
     if let Some(v) = form.slack_allow_channels {
         s.slack_allow_channels = v;
     }
+    if let Some(v) = form.slack_proactive_enabled {
+        s.slack_proactive_enabled = v;
+    }
+    if let Some(v) = form.slack_proactive_snippet {
+        s.slack_proactive_snippet = v.trim().chars().take(8_000).collect();
+    }
     if let Some(v) = form.allow_telegram {
         s.allow_telegram = v;
     }
@@ -189,7 +199,7 @@ pub async fn api_settings_post(
     }
     if let Some(v) = form.agent_name {
         s.agent_name = if v.trim().is_empty() {
-            "Grail".to_string()
+            "μEmployee".to_string()
         } else {
             v
         };
@@ -277,6 +287,7 @@ pub async fn api_tasks(State(state): State<AppState>) -> ApiResult<Value> {
                 "id": t.id,
                 "status": t.status,
                 "provider": t.provider,
+                "is_proactive": t.is_proactive,
                 "channel_id": t.channel_id,
                 "thread_ts": t.thread_ts,
                 "prompt_text": t.prompt_text,

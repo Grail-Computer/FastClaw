@@ -43,6 +43,8 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
           workspace_id,
           slack_allow_from,
           slack_allow_channels,
+          slack_proactive_enabled,
+          slack_proactive_snippet,
           allow_telegram,
           telegram_allow_from,
           allow_slack_mcp,
@@ -82,6 +84,10 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
         slack_allow_channels: row
             .get::<Option<String>, _>("slack_allow_channels")
             .unwrap_or_default(),
+        slack_proactive_enabled: row.get::<i64, _>("slack_proactive_enabled") != 0,
+        slack_proactive_snippet: row
+            .get::<Option<String>, _>("slack_proactive_snippet")
+            .unwrap_or_default(),
         allow_telegram: row.get::<i64, _>("allow_telegram") != 0,
         telegram_allow_from: row
             .get::<Option<String>, _>("telegram_allow_from")
@@ -97,7 +103,7 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
         auto_apply_cron_jobs: row.get::<i64, _>("auto_apply_cron_jobs") != 0,
         agent_name: row
             .get::<Option<String>, _>("agent_name")
-            .unwrap_or_else(|| "Grail".to_string()),
+            .unwrap_or_else(|| "μEmployee".to_string()),
         role_description: row
             .get::<Option<String>, _>("role_description")
             .unwrap_or_default(),
@@ -126,6 +132,8 @@ pub async fn update_settings(pool: &SqlitePool, settings: &Settings) -> anyhow::
             permissions_mode = ?,
             slack_allow_from = ?,
             slack_allow_channels = ?,
+            slack_proactive_enabled = ?,
+            slack_proactive_snippet = ?,
             allow_telegram = ?,
             telegram_allow_from = ?,
             allow_slack_mcp = ?,
@@ -152,6 +160,12 @@ pub async fn update_settings(pool: &SqlitePool, settings: &Settings) -> anyhow::
     .bind(settings.permissions_mode.as_db_str())
     .bind(settings.slack_allow_from.as_str())
     .bind(settings.slack_allow_channels.as_str())
+    .bind(if settings.slack_proactive_enabled {
+        1
+    } else {
+        0
+    })
+    .bind(settings.slack_proactive_snippet.as_str())
     .bind(if settings.allow_telegram { 1 } else { 0 })
     .bind(settings.telegram_allow_from.as_str())
     .bind(if settings.allow_slack_mcp { 1 } else { 0 })
@@ -284,6 +298,7 @@ pub async fn enqueue_task(
         requested_by_user_id,
         prompt_text,
         "",
+        false,
     )
     .await
 }
@@ -298,6 +313,7 @@ pub async fn enqueue_task_with_files(
     requested_by_user_id: &str,
     prompt_text: &str,
     files_json: &str,
+    is_proactive: bool,
 ) -> anyhow::Result<i64> {
     let res = sqlx::query(
         r#"
@@ -311,9 +327,10 @@ pub async fn enqueue_task_with_files(
           requested_by_user_id,
           prompt_text,
           files_json,
+          is_proactive,
           created_at
         )
-        VALUES (?1, 'queued', ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
+        VALUES (?1, 'queued', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch())
         "#,
     )
     .bind(provider)
@@ -324,6 +341,7 @@ pub async fn enqueue_task_with_files(
     .bind(requested_by_user_id)
     .bind(prompt_text)
     .bind(files_json)
+    .bind(if is_proactive { 1 } else { 0 })
     .execute(pool)
     .await
     .context("insert task")?;
@@ -959,6 +977,7 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
           id,
           status,
           provider,
+          is_proactive,
           workspace_id,
           channel_id,
           thread_ts,
@@ -1014,6 +1033,7 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
         provider: row
             .get::<Option<String>, _>("provider")
             .unwrap_or_else(|| "slack".to_string()),
+        is_proactive: row.get::<i64, _>("is_proactive") != 0,
         workspace_id: row.get::<String, _>("workspace_id"),
         channel_id: row.get::<String, _>("channel_id"),
         thread_ts: row.get::<String, _>("thread_ts"),
@@ -1367,6 +1387,7 @@ pub async fn list_recent_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<
           id,
           status,
           provider,
+          is_proactive,
           workspace_id,
           channel_id,
           thread_ts,
@@ -1397,6 +1418,7 @@ pub async fn list_recent_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<
             provider: row
                 .get::<Option<String>, _>("provider")
                 .unwrap_or_else(|| "slack".to_string()),
+            is_proactive: row.get::<i64, _>("is_proactive") != 0,
             workspace_id: row.get::<String, _>("workspace_id"),
             channel_id: row.get::<String, _>("channel_id"),
             thread_ts: row.get::<String, _>("thread_ts"),

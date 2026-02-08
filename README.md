@@ -1,14 +1,33 @@
-# Grail the μEmployee
+# μEmployee (MicroEmployee)
 
-Grail is a single-tenant “micro employee” you deploy as a service and connect to Slack and/or Telegram.
+μEmployee is a single-tenant “micro employee” you deploy as a service and connect to Slack and/or Telegram.
 
 In Slack, you can mention it:
 
-`@Grail do so and so`
+`@μEmployee do so and so`
 
-In Telegram (DM or group), you can address it via `/grail ...` (or @mention in groups).
+In Telegram (DM or group), you can address it via `/microemployee ...` (or @mention in groups).
 
-Grail will:
+## Demo
+
+![MicroEmployee demo](demo/output/microemployee-demo.gif)
+
+Re-record the assets: see `demo/README.md`.
+
+## These Are The Things MicroEmployee Can Do
+
+1. Recap long threads into action items (and attach a markdown report).
+   - ![Thread recap](demo/output/variants/microemployee-v01-thread-recap.gif)
+2. Coordinate incident response: summarize state, owners, next steps.
+   - ![Incident commander](demo/output/variants/microemployee-v02-incident-commander.gif)
+3. Review PRs and call out risk areas with concrete suggestions.
+   - ![PR review](demo/output/variants/microemployee-v03-pr-review.gif)
+4. Triage support requests and propose the next best actions.
+   - ![Support triage](demo/output/variants/microemployee-v05-support-triage.gif)
+5. Safely run operational commands with guardrails and in-Slack approvals.
+   - ![Guardrail approval](demo/output/variants/microemployee-v08-guardrail-approval.gif)
+
+μEmployee will:
 
 - Acknowledge quickly (queues a job).
 - Inject the last **N** recent messages as context (configurable).
@@ -76,7 +95,7 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
   -d "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
 ```
 
-Telegram history note: the Bot API can’t fetch arbitrary chat history, so Grail injects Telegram context from messages it has previously received (stored in SQLite).
+Telegram history note: the Bot API can’t fetch arbitrary chat history, so μEmployee injects Telegram context from messages it has previously received (stored in SQLite).
 
 ## Dashboard
 
@@ -112,7 +131,7 @@ Telegram secrets can also be stored the same way.
 
 Mount a volume at `/data`.
 
-Grail stores:
+μEmployee stores:
 
 - `/data/grail.sqlite` (queue, settings, session mapping)
 - `/data/context/` (durable notes)
@@ -124,7 +143,7 @@ Grail stores:
 - `read`: no command execution; no context writes.
 - `full`: command execution is allowed (with sandboxing); context writes allowed (restricted to `/data/context`).
 
-Even in `read`, Grail can respond and (optionally) use Slack MCP tools to fetch more Slack context.
+Even in `read`, μEmployee can respond and (optionally) use Slack MCP tools to fetch more Slack context.
 
 ## Local Development
 

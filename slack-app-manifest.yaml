@@ -1,11 +1,11 @@
 display_information:
-  name: Grail
+  name: MicroEmployee
   description: Slack micro-employee (Codex-powered)
   background_color: "#000000"
 
 features:
   bot_user:
-    display_name: Grail
+    display_name: MicroEmployee
     always_online: true
 
 oauth_config:
@@ -33,6 +33,8 @@ settings:
     request_url: https://YOUR_SERVICE_DOMAIN/slack/events
     bot_events:
       - app_mention
+      - message.channels
+      - message.groups
       - message.im
       - message.mpim
   interactivity:

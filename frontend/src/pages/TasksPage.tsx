@@ -38,7 +38,16 @@ export function TasksPage() {
                   <span className="pill-dot" />{t.status}
                 </span>
               </td>
-              <td>{t.provider}</td>
+              <td>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span>{t.provider}</span>
+                  {t.is_proactive && (
+                    <span className="pill" style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                      <span className="pill-dot" />proactive
+                    </span>
+                  )}
+                </div>
+              </td>
               <td style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.prompt_text}</td>
               <td style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: t.error_text ? 'var(--red)' : undefined }}>
                 {t.error_text || t.result_text || '—'}

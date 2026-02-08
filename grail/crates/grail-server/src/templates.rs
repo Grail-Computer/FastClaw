@@ -35,6 +35,8 @@ pub struct SettingsTemplate {
     pub permissions_mode: String,
     pub slack_allow_from: String,
     pub slack_allow_channels: String,
+    pub slack_proactive_enabled: bool,
+    pub slack_proactive_snippet: String,
     pub allow_telegram: bool,
     pub telegram_allow_from: String,
     pub allow_slack_mcp: bool,

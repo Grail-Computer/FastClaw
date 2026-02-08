@@ -91,6 +91,42 @@ impl SlackClient {
         headers
     }
 
+    pub async fn auth_test_bot_user_id(&self) -> anyhow::Result<String> {
+        #[derive(Debug, Deserialize)]
+        struct AuthTestResponse {
+            #[serde(default)]
+            user_id: Option<String>,
+        }
+
+        let resp: SlackApiResponse<AuthTestResponse> = self
+            .http
+            .get("https://slack.com/api/auth.test")
+            .headers(self.headers())
+            .send()
+            .await
+            .context("slack auth.test request")?
+            .json()
+            .await
+            .context("slack auth.test decode")?;
+
+        if !resp.ok {
+            anyhow::bail!(
+                "slack auth.test failed: {}",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string())
+            );
+        }
+        let user_id = resp
+            .data
+            .and_then(|d| d.user_id)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if user_id.is_empty() {
+            anyhow::bail!("slack auth.test returned empty user_id");
+        }
+        Ok(user_id)
+    }
+
     pub async fn post_message(
         &self,
         channel: &str,

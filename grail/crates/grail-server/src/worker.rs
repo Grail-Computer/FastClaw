@@ -139,11 +139,14 @@ pub async fn worker_loop(state: AppState) {
                             warn!(error = %msg, task_id, "task failed");
                             let _ = db::complete_task_failure(&state.pool, task_id, &msg).await;
 
-                            let user_msg = format!(
-                                "Task #{task_id} failed. Check /admin/tasks for details.\n\nError: {short}",
-                                short = shorten_error(&msg)
-                            );
-                            let _ = send_user_message(&state, &task, &user_msg).await;
+                            // Proactive tasks should never spam the channel on failure.
+                            if !task.is_proactive {
+                                let user_msg = format!(
+                                    "Task #{task_id} failed. Check /admin/tasks for details.\n\nError: {short}",
+                                    short = shorten_error(&msg)
+                                );
+                                let _ = send_user_message(&state, &task, &user_msg).await;
+                            }
                         }
                     }
                     if let Err(err) = db::set_runtime_active_task(&state.pool, None).await {
@@ -598,93 +601,125 @@ async fn process_task(
         }
     }
 
+    let mut should_post_message = true;
+    let mut should_persist_session = true;
+
     let reply_text = if let Some(parsed) = parsed {
-        // Apply durable updates.
-        if settings.permissions_mode == crate::models::PermissionsMode::Full
-            && settings.allow_context_writes
-        {
-            apply_context_writes(&cwd, &parsed.context_writes).await?;
-        }
+        let should_reply = if task.is_proactive {
+            parsed.should_reply.unwrap_or(false)
+        } else {
+            true
+        };
 
-        // --- Auto-upload files to Slack ---
-        // Upload context_writes + agent-requested upload_files to the originating thread.
-        if provider == "slack" {
-            if let Some(ref sl) = slack {
-                let thread = thread_opt(&task.thread_ts);
+        if task.is_proactive && !should_reply {
+            should_post_message = false;
+            should_persist_session = false;
 
-                // Collect unique paths to upload.
-                let mut upload_paths: std::collections::HashSet<std::path::PathBuf> =
-                    std::collections::HashSet::new();
+            if !parsed.context_writes.is_empty()
+                || !parsed.upload_files.is_empty()
+                || !parsed.cron_jobs.is_empty()
+                || !parsed.guardrail_rules.is_empty()
+            {
+                warn!(
+                    task_id = task.id,
+                    "proactive task returned side effects with should_reply=false; ignoring"
+                );
+            }
 
-                // context_writes paths (only if context writes were actually applied).
-                if settings.permissions_mode == crate::models::PermissionsMode::Full
-                    && settings.allow_context_writes
-                {
-                    for cw in &parsed.context_writes {
-                        let path = cwd.join(&cw.path);
+            "(proactive: skipped)".to_string()
+        } else {
+            // Apply durable updates.
+            if settings.permissions_mode == crate::models::PermissionsMode::Full
+                && settings.allow_context_writes
+            {
+                apply_context_writes(&cwd, &parsed.context_writes).await?;
+            }
+
+            // --- Auto-upload files to Slack ---
+            // Upload context_writes + agent-requested upload_files to the originating thread.
+            if provider == "slack" {
+                if let Some(ref sl) = slack {
+                    let thread = thread_opt(&task.thread_ts);
+
+                    // Collect unique paths to upload.
+                    let mut upload_paths: std::collections::HashSet<std::path::PathBuf> =
+                        std::collections::HashSet::new();
+
+                    // context_writes paths (only if context writes were actually applied).
+                    if settings.permissions_mode == crate::models::PermissionsMode::Full
+                        && settings.allow_context_writes
+                    {
+                        for cw in &parsed.context_writes {
+                            let path = cwd.join(&cw.path);
+                            upload_paths.insert(path);
+                        }
+                    }
+
+                    // Agent-requested uploads.
+                    for rel in &parsed.upload_files {
+                        let path = cwd.join(rel);
                         upload_paths.insert(path);
                     }
-                }
 
-                // Agent-requested uploads.
-                for rel in &parsed.upload_files {
-                    let path = cwd.join(rel);
-                    upload_paths.insert(path);
-                }
-
-                for path in &upload_paths {
-                    if path.exists() {
-                        match tokio::fs::read(path).await {
-                            Ok(content) => {
-                                let filename = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "file".to_string());
-                                if let Err(err) = sl
-                                    .upload_file_content(
-                                        &task.channel_id,
-                                        thread,
-                                        &filename,
-                                        &content,
-                                    )
-                                    .await
-                                {
-                                    warn!(error = %err, file = %filename, "failed to upload file to slack");
+                    for path in &upload_paths {
+                        if path.exists() {
+                            match tokio::fs::read(path).await {
+                                Ok(content) => {
+                                    let filename = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "file".to_string());
+                                    if let Err(err) = sl
+                                        .upload_file_content(
+                                            &task.channel_id,
+                                            thread,
+                                            &filename,
+                                            &content,
+                                        )
+                                        .await
+                                    {
+                                        warn!(error = %err, file = %filename, "failed to upload file to slack");
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(error = %err, path = %path.display(), "failed to read file for upload");
                                 }
                             }
-                            Err(err) => {
-                                warn!(error = %err, path = %path.display(), "failed to read file for upload");
-                            }
+                        } else {
+                            warn!(path = %path.display(), "upload_files path does not exist");
                         }
-                    } else {
-                        warn!(path = %path.display(), "upload_files path does not exist");
                     }
                 }
             }
-        }
 
-        let (mem, redacted) = crate::secrets::redact_secrets(&parsed.updated_memory_summary);
-        if redacted {
-            warn!("redacted secrets from updated_memory_summary");
-        }
-        session.memory_summary = clamp_len(mem, 6_000);
-
-        if settings.allow_cron {
-            if let Err(err) = apply_agent_cron_jobs(state, task, &settings, &parsed.cron_jobs).await
-            {
-                warn!(error = %err, "failed to apply agent cron jobs");
+            let (mem, redacted) = crate::secrets::redact_secrets(&parsed.updated_memory_summary);
+            if redacted {
+                warn!("redacted secrets from updated_memory_summary");
             }
+            session.memory_summary = clamp_len(mem, 6_000);
+
+            if settings.allow_cron {
+                if let Err(err) =
+                    apply_agent_cron_jobs(state, task, &settings, &parsed.cron_jobs).await
+                {
+                    warn!(error = %err, "failed to apply agent cron jobs");
+                }
+            }
+            if let Err(err) =
+                apply_agent_guardrail_rules(state, task, &settings, &parsed.guardrail_rules).await
+            {
+                warn!(error = %err, "failed to apply agent guardrail rules");
+            }
+            let (reply, redacted) = crate::secrets::redact_secrets(&parsed.reply);
+            if redacted {
+                warn!("redacted secrets from reply");
+            }
+            reply
         }
-        if let Err(err) =
-            apply_agent_guardrail_rules(state, task, &settings, &parsed.guardrail_rules).await
-        {
-            warn!(error = %err, "failed to apply agent guardrail rules");
-        }
-        let (reply, redacted) = crate::secrets::redact_secrets(&parsed.reply);
-        if redacted {
-            warn!("redacted secrets from reply");
-        }
-        reply
+    } else if task.is_proactive {
+        should_post_message = false;
+        should_persist_session = false;
+        "(proactive: skipped - invalid agent output)".to_string()
     } else {
         let raw = out.agent_message_text.trim();
         if raw.is_empty() {
@@ -698,32 +733,47 @@ async fn process_task(
         }
     };
 
-    session.last_used_at = chrono::Utc::now().timestamp();
-    db::upsert_session(&state.pool, &session).await?;
-
-    // Reply in the originating channel.
-    match provider.as_str() {
-        "slack" => {
-            let slack = slack.context("slack client missing")?;
-            slack
-                .post_message(&task.channel_id, thread_opt(&task.thread_ts), &reply_text)
-                .await?;
-        }
-        "telegram" => {
-            let tg = telegram.context("telegram client missing")?;
-            let reply_to_message_id = task.thread_ts.parse::<i64>().ok();
-            let _ids = tg
-                .send_message(&task.channel_id, reply_to_message_id, &reply_text)
-                .await?;
-        }
-        _ => {}
+    if should_persist_session {
+        session.last_used_at = chrono::Utc::now().timestamp();
+        db::upsert_session(&state.pool, &session).await?;
     }
 
-    info!(task_id = task.id, provider = %provider, "replied");
+    if should_post_message {
+        // Reply in the originating channel.
+        match provider.as_str() {
+            "slack" => {
+                let slack = slack.context("slack client missing")?;
+                slack
+                    .post_message(&task.channel_id, thread_opt(&task.thread_ts), &reply_text)
+                    .await?;
+            }
+            "telegram" => {
+                let tg = telegram.context("telegram client missing")?;
+                let reply_to_message_id = task.thread_ts.parse::<i64>().ok();
+                let _ids = tg
+                    .send_message(&task.channel_id, reply_to_message_id, &reply_text)
+                    .await?;
+            }
+            _ => {}
+        }
+        info!(task_id = task.id, provider = %provider, "replied");
+    } else {
+        info!(task_id = task.id, provider = %provider, "skipped reply");
+    }
+
     Ok(reply_text)
 }
 
 fn conversation_key_for_task(task: &crate::models::Task) -> String {
+    // Proactive Slack tasks reply in-thread by default, even for "root" messages where
+    // Slack sets thread_ts == event_ts. Use a per-thread key so proactive mode doesn't
+    // stuff every channel message into the shared ":main" session.
+    if task.is_proactive && !task.thread_ts.is_empty() {
+        return format!(
+            "{}:{}:thread:{}",
+            task.workspace_id, task.channel_id, task.thread_ts
+        );
+    }
     if !task.thread_ts.is_empty() && task.thread_ts != task.event_ts {
         format!(
             "{}:{}:thread:{}",
@@ -752,6 +802,7 @@ pub fn agent_output_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
+            "should_reply": { "type": "boolean", "description": "If false, do not reply in chat. Used for proactive Slack mode." },
             "reply": { "type": "string" },
             "updated_memory_summary": { "type": "string" },
             "context_writes": {
@@ -848,7 +899,7 @@ pub fn agent_output_schema() -> serde_json::Value {
                 "default": []
             }
         },
-        "required": ["reply", "updated_memory_summary", "context_writes", "upload_files", "cron_jobs", "guardrail_rules"],
+        "required": ["should_reply", "reply", "updated_memory_summary", "context_writes", "upload_files", "cron_jobs", "guardrail_rules"],
         "additionalProperties": false
     })
 }
@@ -944,6 +995,7 @@ fn build_turn_input(
     }
     s.push_str("Task:\n");
     s.push_str(&format!("- provider: {}\n", task.provider));
+    s.push_str(&format!("- is_proactive: {}\n", task.is_proactive));
     s.push_str(&format!("- workspace_id: {}\n", task.workspace_id));
     s.push_str(&format!("- channel_id: {}\n", task.channel_id));
     s.push_str(&format!("- thread_ts: {}\n", task.thread_ts));
@@ -952,6 +1004,26 @@ fn build_turn_input(
         task.requested_by_user_id
     ));
     s.push_str(&format!("- event_ts: {}\n\n", task.event_ts));
+
+    if task.is_proactive && task.provider.trim().eq_ignore_ascii_case("slack") {
+        s.push_str("Proactive Slack mode:\n");
+        s.push_str("- You were triggered by seeing a channel message without being explicitly @mentioned.\n");
+        s.push_str("- First decide if you should reply. If not clearly relevant, set `should_reply=false`.\n");
+        s.push_str("- If `should_reply=false`, you MUST set:\n");
+        s.push_str("  - reply: \"\" (empty)\n");
+        s.push_str("  - context_writes: []\n");
+        s.push_str("  - upload_files: []\n");
+        s.push_str("  - cron_jobs: []\n");
+        s.push_str("  - guardrail_rules: []\n");
+        s.push_str("  - updated_memory_summary: \"\" (empty)\n");
+        if settings.slack_proactive_snippet.trim().is_empty() {
+            s.push_str("- No proactive snippet is configured. Default policy: only reply when the message is a high-confidence request for help or contains actionable work for you.\n\n");
+        } else {
+            s.push_str("Relevance snippet (authoritative):\n");
+            s.push_str(settings.slack_proactive_snippet.trim());
+            s.push_str("\n\n");
+        }
+    }
 
     s.push_str("Session memory summary (rolling, durable, no secrets):\n");
     if memory_summary.trim().is_empty() {
@@ -1049,12 +1121,19 @@ fn build_turn_input(
     s.push_str("- Any files you create via `context_writes` will automatically be uploaded to this Slack thread.\n");
     s.push_str("- You can also specify additional files to upload via `upload_files` (relative paths under the context directory).\n\n");
 
+    s.push_str("Reply control:\n");
+    s.push_str("- Always include `should_reply`.\n");
+    s.push_str("- For normal (non-proactive) tasks, set `should_reply=true`.\n");
+    s.push_str("- Only set `should_reply=false` for proactive Slack tasks when you should stay silent.\n\n");
+
     s.push_str("Return ONLY a single JSON object matching the provided JSON schema.\n");
     s
 }
 
 #[derive(Debug, Deserialize)]
 struct AgentJson {
+    #[serde(default)]
+    should_reply: Option<bool>,
     reply: String,
     updated_memory_summary: String,
     #[serde(default)]

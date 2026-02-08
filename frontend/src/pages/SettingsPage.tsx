@@ -213,6 +213,23 @@ export function SettingsPage() {
           <input className="form-input" value={data.slack_allow_channels} onChange={(e) => update('slack_allow_channels', e.target.value)} />
         </div>
         <div className="form-checkbox-row">
+          <input type="checkbox" checked={data.slack_proactive_enabled} onChange={(e) => update('slack_proactive_enabled', e.target.checked)} />
+          <label className="form-label" style={{ margin: 0 }}>Proactive mode (listen without @mention)</label>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Proactive relevance snippet</label>
+          <textarea
+            className="form-textarea"
+            rows={4}
+            value={data.slack_proactive_snippet}
+            onChange={(e) => update('slack_proactive_snippet', e.target.value)}
+            placeholder="Example: Reply only when someone asks for help with deployments, incidents, CI failures, or when action items are mentioned. Otherwise ignore."
+          />
+          <p className="section-desc" style={{ marginTop: 8 }}>
+            Tip: set an allowlist of channels to avoid scanning your whole workspace. Requires Slack app events: <span className="pill">message.channels</span> and <span className="pill">message.groups</span>.
+          </p>
+        </div>
+        <div className="form-checkbox-row">
           <input type="checkbox" checked={data.allow_slack_mcp} onChange={(e) => update('allow_slack_mcp', e.target.checked)} />
           <label className="form-label" style={{ margin: 0 }}>Enable Slack MCP Tools</label>
         </div>
