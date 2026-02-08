@@ -147,7 +147,7 @@ function renderMessage(step, index) {
 
   const body = el('div', { class: 'body' });
   const meta = el('div', { class: 'meta' });
-  meta.appendChild(el('span', { class: 'name', text: step.name || (isBot ? 'μEmployee' : 'User') }));
+  meta.appendChild(el('span', { class: 'name', text: step.name || (isBot ? 'Grail' : 'User') }));
   meta.appendChild(el('span', { class: 'time', text: step.time || '' }));
   body.appendChild(meta);
 
@@ -165,12 +165,12 @@ function renderMessage(step, index) {
 
 function renderTyping(step, index) {
   const wrap = el('div', { class: 'slack-typing step', 'data-step': `s${index}` });
-  const av = el('div', { class: 'avatar bot', text: 'μ' });
+  const av = el('div', { class: 'avatar bot', text: 'G' });
   const bubble = el('div', { class: 'typing-bubble' });
   bubble.appendChild(el('span', { class: 'typing-dot' }));
   bubble.appendChild(el('span', { class: 'typing-dot' }));
   bubble.appendChild(el('span', { class: 'typing-dot' }));
-  bubble.appendChild(el('span', { class: 'typing-label', text: `${step.who || 'μEmployee'} is typing...` }));
+  bubble.appendChild(el('span', { class: 'typing-label', text: `${step.who || 'Grail'} is typing...` }));
   wrap.appendChild(av);
   wrap.appendChild(bubble);
   return wrap;
@@ -297,7 +297,7 @@ function renderVariant(v) {
   qs('#title-card-text').textContent = v.title || v.id;
 
   renderSidebar(qs('#sidebar-channels'), v.sidebarChannels, { active: v.channel, kind: 'channel' });
-  renderSidebar(qs('#sidebar-dms'), v.sidebarDms, { active: 'μEmployee', kind: 'dm' });
+  renderSidebar(qs('#sidebar-dms'), v.sidebarDms, { active: 'Grail', kind: 'dm' });
 
   const msgRoot = qs('#messages');
   msgRoot.innerHTML = '';

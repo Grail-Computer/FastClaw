@@ -1,6 +1,6 @@
-# μEmployee Demo (anime.js)
+# Grail Demo (anime.js)
 
-This folder contains a small, standalone animation that visualizes how μEmployee behaves in Slack:
+This folder contains a small, standalone animation that visualizes how Grail behaves in Slack:
 
 - user mentions the agent
 - task gets queued
@@ -40,10 +40,10 @@ npm run record
 
 Outputs are written to `demo/output/`:
 
-- `microemployee-demo.mp4` (recommended for README linking)
-- `microemployee-demo.png` (thumbnail)
-- `microemployee-demo.gif` (preview)
-- `microemployee-demo.webm` (raw Playwright copy)
+- `grail-demo.mp4` (recommended for high quality)
+- `grail-demo.png` (thumbnail)
+- `grail-demo.gif` (preview)
+- `grail-demo.webm` (raw Playwright copy)
 
 Record all variants:
 
