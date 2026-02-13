@@ -1,6 +1,8 @@
 use anyhow::Context;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Client for the Microsoft Teams Bot Framework.
@@ -15,6 +17,141 @@ pub struct TeamsClient {
 struct CachedToken {
     access_token: String,
     expires_at: i64, // unix epoch seconds
+}
+
+#[derive(Clone)]
+struct CachedJwks {
+    keys: Vec<Jwk>,
+    fetched_at: Instant,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenIdConfiguration {
+    jwks_uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JwkSet {
+    keys: Vec<Jwk>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Jwk {
+    kid: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
+}
+
+const BOTFRAMEWORK_OPENID_CONFIG_URL: &str =
+    "https://login.botframework.com/v1/.well-known/openidconfiguration";
+const BOTFRAMEWORK_JWKS_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+fn jwks_cache() -> &'static RwLock<Option<CachedJwks>> {
+    static CACHE: OnceLock<RwLock<Option<CachedJwks>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(None))
+}
+
+async fn fetch_botframework_jwks(http: &reqwest::Client) -> anyhow::Result<Vec<Jwk>> {
+    let config = http
+        .get(BOTFRAMEWORK_OPENID_CONFIG_URL)
+        .send()
+        .await
+        .context("teams openid config request")?
+        .error_for_status()
+        .context("teams openid config status")?
+        .json::<OpenIdConfiguration>()
+        .await
+        .context("parse teams openid config")?;
+
+    let jwks = http
+        .get(&config.jwks_uri)
+        .send()
+        .await
+        .context("teams jwks request")?
+        .error_for_status()
+        .context("teams jwks status")?
+        .json::<JwkSet>()
+        .await
+        .context("parse teams jwks")?;
+
+    Ok(jwks.keys)
+}
+
+async fn load_botframework_jwks(
+    http: &reqwest::Client,
+    force_refresh: bool,
+) -> anyhow::Result<Vec<Jwk>> {
+    let cache = jwks_cache();
+    if !force_refresh {
+        let guard = cache.read().await;
+        if let Some(cached) = guard.as_ref() {
+            if cached.fetched_at.elapsed() < BOTFRAMEWORK_JWKS_CACHE_TTL {
+                return Ok(cached.keys.clone());
+            }
+        }
+    }
+
+    let keys = fetch_botframework_jwks(http).await?;
+    {
+        let mut guard = cache.write().await;
+        *guard = Some(CachedJwks {
+            keys: keys.clone(),
+            fetched_at: Instant::now(),
+        });
+    }
+    Ok(keys)
+}
+
+fn decoding_key_for_kid(keys: &[Jwk], kid: &str) -> anyhow::Result<DecodingKey> {
+    let jwk = keys
+        .iter()
+        .find(|k| k.kid.as_deref() == Some(kid))
+        .with_context(|| format!("teams jwk kid not found: {kid}"))?;
+    let n = jwk
+        .n
+        .as_deref()
+        .context("teams jwk missing modulus (n)")?;
+    let e = jwk
+        .e
+        .as_deref()
+        .context("teams jwk missing exponent (e)")?;
+    DecodingKey::from_rsa_components(n, e).context("invalid teams jwk rsa components")
+}
+
+/// Verify incoming Bot Framework bearer JWT for MS Teams webhooks.
+pub async fn verify_incoming_token(
+    http: &reqwest::Client,
+    app_id: &str,
+    authorization_header: &str,
+) -> anyhow::Result<()> {
+    let token = authorization_header
+        .trim()
+        .strip_prefix("Bearer ")
+        .or_else(|| authorization_header.trim().strip_prefix("bearer "))
+        .context("missing bearer token")?
+        .trim();
+    anyhow::ensure!(!token.is_empty(), "empty bearer token");
+
+    let header = decode_header(token).context("decode teams jwt header")?;
+    let kid = header.kid.as_deref().context("teams jwt missing kid")?;
+
+    let cached_keys = load_botframework_jwks(http, false).await?;
+    let decoding_key = match decoding_key_for_kid(&cached_keys, kid) {
+        Ok(key) => key,
+        Err(_) => {
+            let refreshed_keys = load_botframework_jwks(http, true).await?;
+            decoding_key_for_kid(&refreshed_keys, kid)?
+        }
+    };
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[app_id]);
+    validation.set_issuer(&["https://api.botframework.com"]);
+    validation.leeway = 60;
+
+    decode::<serde_json::Value>(token, &decoding_key, &validation)
+        .context("verify teams jwt")?;
+    Ok(())
 }
 
 impl TeamsClient {

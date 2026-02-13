@@ -7,12 +7,15 @@ mod config;
 mod cron_expr;
 mod crypto;
 mod db;
+mod discord;
 mod github_login;
 mod guardrails;
 mod models;
+mod msteams;
 mod secrets;
 mod slack;
 mod telegram;
+mod whatsapp;
 mod worker;
 
 use std::collections::HashMap;
@@ -41,9 +44,8 @@ use crate::crypto::{parse_master_key, Crypto};
 use crate::models::PermissionsMode;
 use crate::secrets::{
     brave_search_api_key_configured, github_client_id_configured, github_token_configured,
-    openai_api_key_configured,
-    slack_bot_token_configured, slack_signing_secret_configured, telegram_bot_token_configured,
-    telegram_webhook_secret_configured,
+    openai_api_key_configured, slack_bot_token_configured, slack_signing_secret_configured,
+    telegram_bot_token_configured, telegram_webhook_secret_configured,
 };
 use crate::slack::{verify_slack_signature, SlackClient};
 
@@ -182,7 +184,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/slack/events", post(slack_events))
         .route("/slack/actions", post(slack_actions))
-        .route("/telegram/webhook", post(telegram_webhook));
+        .route("/telegram/webhook", post(telegram_webhook))
+        .route("/whatsapp/webhook", get(whatsapp_webhook_verify))
+        .route("/whatsapp/webhook", post(whatsapp_webhook))
+        .route("/discord/webhook", post(discord_webhook))
+        .route("/msteams/webhook", post(msteams_webhook));
 
     // If frontend-dist exists, serve the React SPA at /admin and assets at /assets.
     let frontend_dir = state
@@ -391,6 +397,25 @@ fn host_from_url(s: &str) -> Option<&str> {
     let host_port = after_scheme.split('/').next()?;
     let host_port = host_port.split('@').last().unwrap_or(host_port);
     Some(host_port.split(':').next().unwrap_or(host_port))
+}
+
+fn task_trace_url(state: &AppState, task_id: i64) -> String {
+    state
+        .config
+        .base_url
+        .as_deref()
+        .map(|base| {
+            format!(
+                "{}/admin/tasks/{}",
+                base.trim_end_matches('/'),
+                task_id
+            )
+        })
+        .unwrap_or_else(|| format!("/admin/tasks/{task_id}"))
+}
+
+fn task_link_message(task_id: i64, task_url: &str) -> String {
+    format!("Task queued as #{task_id}. Track progress: {task_url}")
 }
 
 #[cfg(test)]
@@ -1694,9 +1719,7 @@ fn clamp_chars(s: String, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-pub async fn list_context_files(
-    root: &std::path::Path,
-) -> anyhow::Result<Vec<ContextFileRow>> {
+pub async fn list_context_files(root: &std::path::Path) -> anyhow::Result<Vec<ContextFileRow>> {
     let mut out: Vec<ContextFileRow> = Vec::new();
 
     let mut stack = vec![root.to_path_buf()];
@@ -1853,4 +1876,441 @@ enum SlackEvent {
 
     #[serde(other)]
     Other,
+}
+
+// ---------------------------------------------------------------------------
+// WhatsApp webhook
+// ---------------------------------------------------------------------------
+
+/// GET handler for WhatsApp webhook verification (subscribe challenge).
+async fn whatsapp_webhook_verify(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let mode = params.get("hub.mode").map(|s| s.as_str()).unwrap_or("");
+    let token = params
+        .get("hub.verify_token")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let challenge = params
+        .get("hub.challenge")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    if mode != "subscribe" {
+        return (StatusCode::FORBIDDEN, "invalid mode").into_response();
+    }
+
+    let verify_token = match crate::secrets::load_whatsapp_verify_token_opt(&state).await {
+        Ok(Some(t)) => t,
+        _ => return (StatusCode::FORBIDDEN, "verify token not configured").into_response(),
+    };
+
+    if token != verify_token {
+        return (StatusCode::FORBIDDEN, "token mismatch").into_response();
+    }
+
+    (StatusCode::OK, challenge.to_string()).into_response()
+}
+
+/// POST handler for WhatsApp inbound messages.
+async fn whatsapp_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let settings = match db::get_settings(&state.pool).await {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response(),
+    };
+
+    if !settings.allow_whatsapp {
+        return (StatusCode::OK, "whatsapp disabled").into_response();
+    }
+
+    let app_secret = match crate::secrets::load_whatsapp_app_secret_opt(&state).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return (StatusCode::UNAUTHORIZED, "whatsapp app secret not configured").into_response();
+        }
+        Err(err) => {
+            error!(error = %err, "failed to load whatsapp app secret");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "secret error").into_response();
+        }
+    };
+    let signature_header = headers
+        .get("X-Hub-Signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !crate::whatsapp::verify_signature(&app_secret, &body, signature_header) {
+        return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+    }
+
+    let payload: crate::whatsapp::WhatsAppWebhookPayload = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, "invalid whatsapp payload");
+            return (StatusCode::BAD_REQUEST, "invalid payload").into_response();
+        }
+    };
+
+    let entries = match payload.entry {
+        Some(e) => e,
+        None => return (StatusCode::OK, "").into_response(),
+    };
+
+    for entry in entries {
+        let changes = match entry.changes {
+            Some(c) => c,
+            None => continue,
+        };
+        for change in changes {
+            let value = match change.value {
+                Some(v) => v,
+                None => continue,
+            };
+            let messages = match value.messages {
+                Some(m) => m,
+                None => continue,
+            };
+            for msg in messages {
+                if msg.kind != "text" {
+                    continue;
+                }
+                let text = match msg.text {
+                    Some(ref t) => t.body.clone(),
+                    None => continue,
+                };
+                let from = &msg.from;
+
+                // Check allow list.
+                let allowed = parse_allow_from(&settings.whatsapp_allow_from);
+                if !allowed.is_empty() && !allowed.contains(from.as_str()) {
+                    warn!(from = %from, "whatsapp user not in allow list");
+                    continue;
+                }
+
+                // Deduplicate.
+                let event_id = format!("whatsapp:{}", msg.id);
+                let wid = "whatsapp";
+                match db::try_mark_event_processed(&state.pool, wid, &event_id).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(err) => {
+                        error!(error = %err, "whatsapp dedup check failed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "dedup error").into_response();
+                    }
+                }
+
+                let prompt = clamp_chars(text, 4_000);
+                if prompt.is_empty() {
+                    continue;
+                }
+
+                // channel_id = sender phone number (used to reply back).
+                if let Err(err) = db::enqueue_task(
+                    &state.pool,
+                    "whatsapp",
+                    wid,
+                    from,
+                    &msg.id,
+                    &msg.id,
+                    from,
+                    &prompt,
+                )
+                .await
+                {
+                    error!(
+                        error = %err,
+                        from = %from,
+                        message_id = %msg.id,
+                        "failed to enqueue whatsapp task"
+                    );
+                    let _ = db::unmark_event_processed(&state.pool, wid, &event_id).await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response();
+                }
+
+                state.task_notify.notify_waiters();
+            }
+        }
+    }
+
+    (StatusCode::OK, "").into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Discord webhook
+// ---------------------------------------------------------------------------
+
+async fn discord_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    // Verify Ed25519 signature.
+    let public_key = match crate::secrets::load_discord_public_key_opt(&state).await {
+        Ok(Some(k)) => k,
+        _ => return (StatusCode::UNAUTHORIZED, "public key not configured").into_response(),
+    };
+
+    let signature = headers
+        .get("X-Signature-Ed25519")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let timestamp = headers
+        .get("X-Signature-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if signature.is_empty() || timestamp.is_empty() {
+        return (StatusCode::UNAUTHORIZED, "missing signature headers").into_response();
+    }
+    if !crate::discord::is_timestamp_fresh(timestamp, 300) {
+        return (StatusCode::UNAUTHORIZED, "stale signature timestamp").into_response();
+    }
+    if !crate::discord::verify_discord_signature(&public_key, signature, timestamp, &body) {
+        return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+    }
+
+    let interaction: crate::discord::DiscordInteraction = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, "invalid discord payload");
+            return (StatusCode::BAD_REQUEST, "invalid payload").into_response();
+        }
+    };
+
+    // PING (type 1) — Discord verification handshake.
+    if interaction.kind == 1 {
+        let pong = serde_json::json!({ "type": 1 });
+        return axum::response::Json(pong).into_response();
+    }
+
+    let settings = match db::get_settings(&state.pool).await {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response(),
+    };
+
+    if !settings.allow_discord {
+        return (StatusCode::OK, "discord disabled").into_response();
+    }
+
+    // Handle APPLICATION_COMMAND (type 2) interactions.
+    if interaction.kind == 2 {
+        let channel_id = interaction.channel_id.as_deref().unwrap_or("");
+        let user_id = interaction
+            .member
+            .as_ref()
+            .and_then(|m| m.user.as_ref())
+            .or(interaction.user.as_ref())
+            .map(|u| u.id.as_str())
+            .unwrap_or("unknown");
+
+        // Check allow list.
+        let allowed = parse_allow_from(&settings.discord_allow_from);
+        if !allowed.is_empty() && !allowed.contains(user_id) {
+            warn!(user = %user_id, "discord user not in allow list");
+            let resp = serde_json::json!({
+                "type": 4,
+                "data": { "content": "You are not authorized to use this bot." }
+            });
+            return axum::response::Json(resp).into_response();
+        }
+
+        // Extract text from the interaction data.
+        let text = interaction
+            .data
+            .as_ref()
+            .and_then(|d| d.get("options"))
+            .and_then(|o| o.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|o| o.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let prompt = clamp_chars(text, 4_000);
+
+        let interaction_id = interaction.id.as_deref().unwrap_or("");
+
+        // Deduplicate.
+        let event_id = format!("discord:{}", interaction_id);
+        match db::try_mark_event_processed(&state.pool, "discord", &event_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let resp = serde_json::json!({
+                    "type": 4,
+                    "data": { "content": "Already processing this request." }
+                });
+                return axum::response::Json(resp).into_response();
+            }
+            Err(err) => {
+                error!(error = %err, "discord dedup check failed");
+                let resp = serde_json::json!({
+                    "type": 4,
+                    "data": { "content": "Temporary server error. Please retry." }
+                });
+                return axum::response::Json(resp).into_response();
+            }
+        }
+
+        if !prompt.is_empty() {
+            if let Err(err) = db::enqueue_task(
+                &state.pool,
+                "discord",
+                "discord",
+                channel_id,
+                interaction_id,
+                interaction_id,
+                user_id,
+                &prompt,
+            )
+            .await
+            {
+                error!(
+                    error = %err,
+                    interaction_id = %interaction_id,
+                    user_id = %user_id,
+                    "failed to enqueue discord task"
+                );
+                let _ = db::unmark_event_processed(&state.pool, "discord", &event_id).await;
+                let resp = serde_json::json!({
+                    "type": 4,
+                    "data": { "content": "Failed to queue request. Please retry." }
+                });
+                return axum::response::Json(resp).into_response();
+            }
+            state.task_notify.notify_waiters();
+        }
+
+        // ACK with deferred response.
+        let resp = serde_json::json!({
+            "type": 5 // DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+        });
+        return axum::response::Json(resp).into_response();
+    }
+
+    (StatusCode::OK, "").into_response()
+}
+
+// ---------------------------------------------------------------------------
+// MS Teams webhook
+// ---------------------------------------------------------------------------
+
+async fn msteams_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let settings = match db::get_settings(&state.pool).await {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response(),
+    };
+
+    if !settings.allow_msteams {
+        return (StatusCode::OK, "msteams disabled").into_response();
+    }
+
+    let app_id = match crate::secrets::load_msteams_app_id_opt(&state).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return (StatusCode::UNAUTHORIZED, "teams app id not configured").into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to load teams app id");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "secret error").into_response();
+        }
+    };
+    let authorization_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Err(err) =
+        crate::msteams::verify_incoming_token(&state.http, &app_id, authorization_header).await
+    {
+        warn!(error = %err, "invalid teams authorization token");
+        return (StatusCode::UNAUTHORIZED, "invalid authorization").into_response();
+    }
+
+    let activity: crate::msteams::TeamsActivity = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, "invalid teams payload");
+            return (StatusCode::BAD_REQUEST, "invalid payload").into_response();
+        }
+    };
+
+    // Only process "message" activities.
+    if activity.kind != "message" {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    let text = match activity.text.as_deref() {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => return (StatusCode::OK, "").into_response(),
+    };
+
+    let from_id = activity
+        .from
+        .as_ref()
+        .map(|f| f.id.as_str())
+        .unwrap_or("unknown");
+
+    // Check allow list.
+    let allowed = parse_allow_from(&settings.msteams_allow_from);
+    if !allowed.is_empty() && !allowed.contains(from_id) {
+        warn!(from = %from_id, "teams user not in allow list");
+        return (StatusCode::OK, "").into_response();
+    }
+
+    let conversation_id = activity
+        .conversation
+        .as_ref()
+        .map(|c| c.id.as_str())
+        .unwrap_or("");
+    let activity_id = activity.id.as_deref().unwrap_or("");
+    let service_url = activity.service_url.as_deref().unwrap_or("");
+
+    // Store service_url|activity_id in thread_ts for reply routing.
+    let thread_ts = format!("{}|{}", service_url, activity_id);
+
+    // Deduplicate.
+    let event_id = format!("teams:{}", activity_id);
+    match db::try_mark_event_processed(&state.pool, "msteams", &event_id).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::OK, "").into_response(),
+        Err(err) => {
+            warn!(error = %err, "teams dedup check failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "dedup error").into_response();
+        }
+    }
+
+    let prompt = clamp_chars(text, 4_000);
+    if prompt.is_empty() {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    if let Err(err) = db::enqueue_task(
+        &state.pool,
+        "msteams",
+        "msteams",
+        conversation_id,
+        &thread_ts,
+        &thread_ts,
+        from_id,
+        &prompt,
+    )
+    .await
+    {
+        error!(
+            error = %err,
+            activity_id = %activity_id,
+            from_id = %from_id,
+            "failed to enqueue teams task"
+        );
+        let _ = db::unmark_event_processed(&state.pool, "msteams", &event_id).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response();
+    }
+
+    state.task_notify.notify_waiters();
+
+    (StatusCode::OK, "").into_response()
 }

@@ -27,6 +27,126 @@ pub struct CodexTurnEvent {
     pub details: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct BrowserEnvConfig {
+    pub enabled: bool,
+    pub cdp_url: String,
+    pub cdp_port: String,
+    pub novnc_enabled: bool,
+    pub novnc_url: String,
+    pub novnc_port: String,
+    pub profile_name: String,
+    pub home: String,
+}
+
+impl BrowserEnvConfig {
+    pub fn from_env() -> Self {
+        let enabled = env_bool("GRAIL_BROWSER_ENABLED") || env_bool("OPENCLAW_BROWSER_ENABLED");
+        let cdp_port = normalize_port(
+            env_first_value("GRAIL_BROWSER_CDP_PORT", "OPENCLAW_BROWSER_CDP_PORT"),
+            "9222",
+        );
+        let novnc_enabled = enabled && (env_bool("GRAIL_BROWSER_ENABLE_NOVNC") || env_bool("OPENCLAW_BROWSER_ENABLE_NOVNC"));
+        let novnc_port = normalize_port(
+            env_first_value("GRAIL_BROWSER_NOVNC_PORT", "OPENCLAW_BROWSER_NOVNC_PORT"),
+            "6080",
+        );
+        let cdp_url_default = format!("http://127.0.0.1:{cdp_port}");
+        let novnc_url_default = format!(
+            "http://127.0.0.1:{novnc_port}/vnc.html?autoconnect=1&resize=remote"
+        );
+
+        Self {
+            enabled,
+            cdp_url: normalize_http_url(
+                env_first_value("GRAIL_BROWSER_CDP_URL", "OPENCLAW_BROWSER_CDP_URL"),
+                &cdp_url_default,
+            ),
+            cdp_port,
+            novnc_enabled,
+            novnc_port: novnc_port.clone(),
+            novnc_url: if novnc_enabled {
+                normalize_http_url(
+                    env_first_value("GRAIL_BROWSER_NOVNC_URL", "OPENCLAW_BROWSER_NOVNC_URL"),
+                    &novnc_url_default,
+                )
+            } else {
+                String::new()
+            },
+            profile_name: {
+                normalize_profile_name(
+                    env_first_value("GRAIL_BROWSER_PROFILE_NAME", "OPENCLAW_BROWSER_PROFILE_NAME")
+                        .unwrap_or_else(|| "default".to_string()),
+                    "default",
+                )
+            },
+            home: env_value("GRAIL_BROWSER_HOME", &env_value("OPENCLAW_BROWSER_HOME", "/data/browser-profiles")),
+        }
+    }
+}
+
+fn env_first_value(primary: &str, fallback: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(fallback).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn normalize_port(value: Option<String>, default: &str) -> String {
+    let candidate = value.unwrap_or_else(|| default.to_string());
+    match candidate.parse::<u16>() {
+        Ok(port) if port > 0 => port.to_string(),
+        _ => default.to_string(),
+    }
+}
+
+fn normalize_http_url(value: Option<String>, default: &str) -> String {
+    let candidate = value.unwrap_or_else(|| default.to_string()).trim().to_string();
+    if candidate.starts_with("http://") || candidate.starts_with("https://") {
+        candidate
+    } else {
+        default.to_string()
+    }
+}
+
+fn normalize_profile_name(raw: String, default: &str) -> String {
+    let mut cleaned = raw
+        .trim()
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+
+    while cleaned.contains("--") {
+        cleaned = cleaned.replace("--", "-");
+    }
+
+    let cleaned = cleaned.trim_matches('-').trim();
+    if cleaned.is_empty() {
+        default.to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
+fn env_value(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
 #[derive(Debug)]
 struct CodexProc {
     child: Child,
@@ -73,6 +193,7 @@ impl CodexManager {
         allow_slack_mcp: bool,
         allow_web_mcp: bool,
         extra_mcp_config: Option<&str>,
+        browser: &BrowserEnvConfig,
     ) -> anyhow::Result<()> {
         let codex_home = self.config.effective_codex_home();
         tokio::fs::create_dir_all(&codex_home)
@@ -113,14 +234,22 @@ impl CodexManager {
         // Restart the app-server if the auth inputs changed.
         let env_fp = sha256_hex(
             format!(
-                "openai_api_key={};slack_bot_token={};slack_allow_channels={};brave_search_api_key={};web_allow_domains={};web_deny_domains={};codex_home={}",
+                "openai_api_key={};slack_bot_token={};slack_allow_channels={};brave_search_api_key={};web_allow_domains={};web_deny_domains={};codex_home={};browser_enabled={};browser_cdp_url={};browser_cdp_port={};browser_profile_name={};browser_home={};browser_novnc_enabled={};browser_novnc_url={};browser_novnc_port={}",
                 openai_api_key.unwrap_or(""),
                 slack_bot_token.unwrap_or(""),
                 slack_allow_channels.unwrap_or(""),
                 brave_search_api_key.unwrap_or(""),
                 web_allow_domains.unwrap_or(""),
                 web_deny_domains.unwrap_or(""),
-                codex_home.display()
+                codex_home.display(),
+                browser.enabled,
+                browser.cdp_url,
+                browser.cdp_port,
+                browser.profile_name,
+                browser.home,
+                browser.novnc_enabled,
+                browser.novnc_url,
+                browser.novnc_port
             )
             .as_bytes(),
         );
@@ -153,6 +282,7 @@ impl CodexManager {
                 brave_search_api_key,
                 web_allow_domains,
                 web_deny_domains,
+                browser,
             )
             .await?;
             self.proc = Some(proc);
@@ -627,8 +757,9 @@ async fn spawn_codex_app_server(
     slack_bot_token: Option<&str>,
     slack_allow_channels: Option<&str>,
     brave_search_api_key: Option<&str>,
-    web_allow_domains: Option<&str>,
-    web_deny_domains: Option<&str>,
+        web_allow_domains: Option<&str>,
+        web_deny_domains: Option<&str>,
+        browser: &BrowserEnvConfig,
 ) -> anyhow::Result<CodexProc> {
     // Codex CLI argument surface has changed across versions. Some builds accept
     // `--listen stdio://` while others default to stdio and reject `--listen`.
@@ -648,12 +779,13 @@ async fn spawn_codex_app_server(
             slack_bot_token,
             slack_allow_channels,
             brave_search_api_key,
-            web_allow_domains,
-            web_deny_domains,
-        )
-        .await
-        {
-            Ok(proc) => return Ok(proc),
+                web_allow_domains,
+                web_deny_domains,
+                browser,
+            )
+            .await
+            {
+                Ok(proc) => return Ok(proc),
             Err(err) => {
                 warn!(error = %err, args = ?args, "failed to start codex app-server");
             }
@@ -671,8 +803,9 @@ async fn spawn_codex_with_args(
     slack_bot_token: Option<&str>,
     slack_allow_channels: Option<&str>,
     brave_search_api_key: Option<&str>,
-    web_allow_domains: Option<&str>,
-    web_deny_domains: Option<&str>,
+        web_allow_domains: Option<&str>,
+        web_deny_domains: Option<&str>,
+        browser: &BrowserEnvConfig,
 ) -> anyhow::Result<CodexProc> {
     let mut cmd = Command::new(codex_bin);
     cmd.args(args);
@@ -694,6 +827,44 @@ async fn spawn_codex_with_args(
     }
     if let Some(v) = web_deny_domains {
         cmd.env("GRAIL_WEB_DENY_DOMAINS", v);
+    }
+    if browser.enabled {
+        cmd.env("GRAIL_BROWSER_ENABLED", "1");
+        cmd.env("OPENCLAW_BROWSER_ENABLED", "1");
+    } else {
+        cmd.env("GRAIL_BROWSER_ENABLED", "0");
+        cmd.env("OPENCLAW_BROWSER_ENABLED", "0");
+    }
+    if !browser.cdp_url.is_empty() {
+        cmd.env("GRAIL_BROWSER_CDP_URL", browser.cdp_url.as_str());
+        cmd.env("OPENCLAW_BROWSER_CDP_URL", browser.cdp_url.as_str());
+    }
+    if !browser.cdp_port.is_empty() {
+        cmd.env("GRAIL_BROWSER_CDP_PORT", browser.cdp_port.as_str());
+        cmd.env("OPENCLAW_BROWSER_CDP_PORT", browser.cdp_port.as_str());
+    }
+    if browser.novnc_enabled {
+        cmd.env("GRAIL_BROWSER_ENABLE_NOVNC", "1");
+        cmd.env("OPENCLAW_BROWSER_ENABLE_NOVNC", "1");
+        if !browser.novnc_url.is_empty() {
+            cmd.env("GRAIL_BROWSER_NOVNC_URL", browser.novnc_url.as_str());
+            cmd.env("OPENCLAW_BROWSER_NOVNC_URL", browser.novnc_url.as_str());
+        }
+        if !browser.novnc_port.is_empty() {
+            cmd.env("GRAIL_BROWSER_NOVNC_PORT", browser.novnc_port.as_str());
+            cmd.env("OPENCLAW_BROWSER_NOVNC_PORT", browser.novnc_port.as_str());
+        }
+    } else {
+        cmd.env("GRAIL_BROWSER_ENABLE_NOVNC", "0");
+        cmd.env("OPENCLAW_BROWSER_ENABLE_NOVNC", "0");
+    }
+    if !browser.profile_name.is_empty() {
+        cmd.env("GRAIL_BROWSER_PROFILE_NAME", browser.profile_name.as_str());
+        cmd.env("OPENCLAW_BROWSER_PROFILE_NAME", browser.profile_name.as_str());
+    }
+    if !browser.home.is_empty() {
+        cmd.env("GRAIL_BROWSER_HOME", browser.home.as_str());
+        cmd.env("OPENCLAW_BROWSER_HOME", browser.home.as_str());
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

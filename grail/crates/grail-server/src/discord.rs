@@ -83,6 +83,18 @@ pub fn verify_discord_signature(
     verifying_key.verify(&message, &signature).is_ok()
 }
 
+/// Reject stale/replayed requests by enforcing a bounded timestamp skew.
+pub fn is_timestamp_fresh(timestamp: &str, max_skew_seconds: i64) -> bool {
+    if max_skew_seconds < 0 {
+        return false;
+    }
+    let Ok(ts) = timestamp.parse::<i64>() else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp();
+    (now - ts).abs() <= max_skew_seconds
+}
+
 // --- Webhook / Interaction payload types ---
 
 #[derive(Debug, Clone, Deserialize)]

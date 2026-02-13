@@ -788,6 +788,9 @@ async fn process_task(
     let provider = task.provider.trim().to_ascii_lowercase();
     let mut slack: Option<SlackClient> = None;
     let mut telegram: Option<TelegramClient> = None;
+    let mut whatsapp: Option<crate::whatsapp::WhatsAppClient> = None;
+    let mut discord: Option<crate::discord::DiscordClient> = None;
+    let mut msteams: Option<crate::msteams::TeamsClient> = None;
     let mut slack_bot_token_for_mcp: Option<String> = None;
 
     let context_text = match provider.as_str() {
@@ -842,6 +845,50 @@ async fn process_task(
             telegram = Some(client);
             format_telegram_context(&ctx)
         }
+        "whatsapp" => {
+            let Some(access_token) = crate::secrets::load_whatsapp_access_token_opt(state).await?
+            else {
+                anyhow::bail!("WHATSAPP_ACCESS_TOKEN is not configured");
+            };
+            let Some(phone_id) = crate::secrets::load_whatsapp_phone_number_id_opt(state).await?
+            else {
+                anyhow::bail!("WHATSAPP_PHONE_NUMBER_ID is not configured");
+            };
+            whatsapp = Some(crate::whatsapp::WhatsAppClient::new(
+                state.http.clone(),
+                access_token,
+                phone_id,
+            ));
+            // No context fetching for WhatsApp yet.
+            String::new()
+        }
+        "discord" => {
+            let Some(bot_token) = crate::secrets::load_discord_bot_token_opt(state).await? else {
+                anyhow::bail!("DISCORD_BOT_TOKEN is not configured");
+            };
+            discord = Some(crate::discord::DiscordClient::new(
+                state.http.clone(),
+                bot_token,
+            ));
+            // No context fetching for Discord yet.
+            String::new()
+        }
+        "msteams" => {
+            let Some(app_id) = crate::secrets::load_msteams_app_id_opt(state).await? else {
+                anyhow::bail!("MSTEAMS_APP_ID is not configured");
+            };
+            let Some(app_password) = crate::secrets::load_msteams_app_password_opt(state).await?
+            else {
+                anyhow::bail!("MSTEAMS_APP_PASSWORD is not configured");
+            };
+            msteams = Some(crate::msteams::TeamsClient::new(
+                state.http.clone(),
+                app_id,
+                app_password,
+            ));
+            // No context fetching for MS Teams yet.
+            String::new()
+        }
         other => anyhow::bail!("unknown task provider: {other}"),
     };
 
@@ -858,6 +905,7 @@ async fn process_task(
 
     let allow_slack_mcp = provider == "slack" && settings.allow_slack_mcp;
     let allow_web_mcp = settings.allow_web_mcp;
+    let browser = crate::codex::BrowserEnvConfig::from_env();
     let brave_search_api_key = crate::secrets::load_brave_search_api_key_opt(state).await?;
     codex
         .ensure_started(
@@ -890,6 +938,7 @@ async fn process_task(
             allow_slack_mcp,
             allow_web_mcp,
             Some(settings.extra_mcp_config.as_str()),
+            &browser,
         )
         .await?;
 
@@ -961,6 +1010,7 @@ async fn process_task(
         &repo_context_text,
         allow_slack_mcp,
         allow_web_mcp,
+        &browser,
     );
 
     let (trace_tx, mut trace_rx) = mpsc::unbounded_channel::<crate::codex::CodexTurnEvent>();
@@ -1033,39 +1083,43 @@ async fn process_task(
     let mut should_persist_session = true;
 
     let reply_text = if let Some(parsed) = parsed {
-        let should_reply = if task.is_proactive {
+        let mut should_reply = if task.is_proactive {
             parsed.should_reply.unwrap_or(false)
         } else {
             true
         };
+        let is_browser_login_needed = parsed.browser_login_needed;
+        if is_browser_login_needed {
+            should_reply = true;
+        }
+
+        let requested_side_effects = !parsed.context_writes.is_empty()
+            || !parsed.upload_files.is_empty()
+            || !parsed.cron_jobs.is_empty()
+            || !parsed.guardrail_rules.is_empty();
+        if is_browser_login_needed && requested_side_effects {
+            warn!(
+                task_id = task.id,
+                "browser-login request included side-effect fields; ignoring for this turn"
+            );
+        }
 
         if task.is_proactive && !should_reply {
             should_post_message = false;
             should_persist_session = false;
-
-            if !parsed.context_writes.is_empty()
-                || !parsed.upload_files.is_empty()
-                || !parsed.cron_jobs.is_empty()
-                || !parsed.guardrail_rules.is_empty()
-            {
-                warn!(
-                    task_id = task.id,
-                    "proactive task returned side effects with should_reply=false; ignoring"
-                );
-            }
-
             "(proactive: skipped)".to_string()
         } else {
             // Apply durable updates.
             if settings.permissions_mode == crate::models::PermissionsMode::Full
                 && settings.allow_context_writes
+                && !is_browser_login_needed
             {
                 apply_context_writes(&cwd, &parsed.context_writes).await?;
             }
 
             // --- Auto-upload files to Slack ---
             // Upload context_writes + agent-requested upload_files to the originating thread.
-            if provider == "slack" {
+            if provider == "slack" && !is_browser_login_needed {
                 if let Some(ref sl) = slack {
                     let thread = thread_opt(&task.thread_ts);
 
@@ -1131,21 +1185,32 @@ async fn process_task(
             }
             session.memory_summary = clamp_len(mem, 6_000);
 
-            if settings.allow_cron {
+            if settings.allow_cron && !is_browser_login_needed {
                 if let Err(err) =
                     apply_agent_cron_jobs(state, task, &settings, &parsed.cron_jobs).await
                 {
                     warn!(error = %err, "failed to apply agent cron jobs");
                 }
             }
-            if let Err(err) =
-                apply_agent_guardrail_rules(state, task, &settings, &parsed.guardrail_rules).await
-            {
-                warn!(error = %err, "failed to apply agent guardrail rules");
+            if !is_browser_login_needed {
+                if let Err(err) =
+                    apply_agent_guardrail_rules(state, task, &settings, &parsed.guardrail_rules).await
+                {
+                    warn!(error = %err, "failed to apply agent guardrail rules");
+                }
             }
-            let (reply, redacted) = crate::secrets::redact_secrets(&parsed.reply);
+            let (mut reply, redacted) = crate::secrets::redact_secrets(&parsed.reply);
             if redacted {
                 warn!("redacted secrets from reply");
+            }
+            if is_browser_login_needed {
+                reply = compose_browser_login_reply(
+                    reply,
+                    parsed.browser_login_url.as_deref(),
+                    parsed.browser_login_instructions.as_deref(),
+                    parsed.browser_profile.as_deref(),
+                    &browser,
+                );
             }
             reply
         }
@@ -1186,6 +1251,34 @@ async fn process_task(
                 let _ids = tg
                     .send_message(&task.channel_id, reply_to_message_id, &reply_text)
                     .await?;
+            }
+            "whatsapp" => {
+                let wa = whatsapp.context("whatsapp client missing")?;
+                wa.send_message(&task.channel_id, &reply_text).await?;
+            }
+            "discord" => {
+                let dc = discord.context("discord client missing")?;
+                dc.send_message(&task.channel_id, &reply_text).await?;
+            }
+            "msteams" => {
+                let teams = msteams.context("msteams client missing")?;
+                // thread_ts stores service_url|activity_id for reply threading.
+                let parts: Vec<&str> = task.thread_ts.splitn(2, '|').collect();
+                if parts.len() == 2 {
+                    teams
+                        .reply_to_activity(parts[0], &task.channel_id, parts[1], &reply_text)
+                        .await?;
+                } else {
+                    // Fallback: post to conversation directly.
+                    let service_url = if task.thread_ts.starts_with("http") {
+                        task.thread_ts.as_str()
+                    } else {
+                        "https://smba.trafficmanager.net/teams"
+                    };
+                    teams
+                        .send_message(service_url, &task.channel_id, &reply_text)
+                        .await?;
+                }
             }
             _ => {}
         }
@@ -1664,11 +1757,21 @@ pub fn agent_output_schema() -> serde_json::Value {
     // Optional fields must be represented as nullable (e.g., `anyOf: [{...}, {type:null}]`).
     serde_json::json!({
         "type": "object",
-        "properties": {
-            "should_reply": { "type": "boolean", "description": "If false, do not reply in chat. Used for proactive Slack mode." },
-            "reply": { "type": "string" },
-            "updated_memory_summary": { "type": "string" },
-            "context_writes": {
+    "properties": {
+        "should_reply": { "type": "boolean", "description": "If false, do not reply in chat. Used for proactive Slack mode." },
+        "reply": { "type": "string" },
+        "browser_login_needed": { "type": "boolean", "default": false },
+        "browser_login_url": { "anyOf": [{ "type": "string" }, { "type": "null" }], "default": null },
+        "browser_login_instructions": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }],
+            "default": null
+        },
+        "browser_profile": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }],
+            "default": null
+        },
+        "updated_memory_summary": { "type": "string" },
+        "context_writes": {
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1762,7 +1865,19 @@ pub fn agent_output_schema() -> serde_json::Value {
                 "default": []
             }
         },
-        "required": ["should_reply", "reply", "updated_memory_summary", "context_writes", "upload_files", "cron_jobs", "guardrail_rules"],
+        "required": [
+            "should_reply",
+            "reply",
+            "browser_login_needed",
+            "browser_login_url",
+            "browser_login_instructions",
+            "browser_profile",
+            "updated_memory_summary",
+            "context_writes",
+            "upload_files",
+            "cron_jobs",
+            "guardrail_rules"
+        ],
         "additionalProperties": false
     })
 }
@@ -1847,6 +1962,7 @@ fn build_turn_input(
     repo_context: &str,
     allow_slack_mcp: bool,
     allow_web_mcp: bool,
+    browser: &crate::codex::BrowserEnvConfig,
 ) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -1947,6 +2063,32 @@ fn build_turn_input(
         s.push_str("Web tools are disabled.\n\n");
     }
 
+    s.push_str("Browser automation:\n");
+    if browser.enabled {
+        s.push_str("Browser automation is enabled.\n");
+        s.push_str(&format!("- CDP URL: {}\n", browser.cdp_url));
+        s.push_str(&format!("- CDP port: {}\n", browser.cdp_port));
+        s.push_str(&format!("- Profile: {}\n", browser.profile_name));
+        s.push_str("- Never ask the user to send passwords, OTP codes, or secrets in chat.\n");
+        if browser.novnc_enabled && !browser.novnc_url.is_empty() {
+            s.push_str(&format!("- noVNC URL: {}\n", browser.novnc_url));
+            s.push_str(
+                "If login is blocked by MFA/captcha, request a manual browser handoff by setting `browser_login_needed=true`.\n",
+            );
+            s.push_str(
+                "Include `browser_login_url` (a noVNC URL), `browser_login_instructions`, and `browser_profile` in that reply.\n",
+            );
+            s.push_str(
+                "- For scripted browser automation, use `uv run` (or an equivalent runner) and point your browser tool/driver to the CDP URL above.\n",
+            );
+        } else {
+            s.push_str("- noVNC is not enabled. Manual browser handoff is limited.\n");
+        }
+        s.push_str("- Do not apply side effects (context_writes/upload_files/cron_jobs/guardrail_rules) when `browser_login_needed=true`.\n\n");
+    } else {
+        s.push_str("Browser automation is disabled.\n\n");
+    }
+
     s.push_str("User request:\n");
     s.push_str(task.prompt_text.trim());
     s.push_str("\n\n");
@@ -2015,6 +2157,14 @@ struct AgentJson {
     #[serde(default)]
     should_reply: Option<bool>,
     reply: String,
+    #[serde(default)]
+    browser_login_needed: bool,
+    #[serde(default)]
+    browser_login_url: Option<String>,
+    #[serde(default)]
+    browser_login_instructions: Option<String>,
+    #[serde(default)]
+    browser_profile: Option<String>,
     updated_memory_summary: String,
     #[serde(default)]
     context_writes: Vec<ContextWrite>,
@@ -2085,6 +2235,60 @@ fn parse_agent_json(text: &str) -> anyhow::Result<AgentJson> {
     }
     let slice = &t[start..=end];
     serde_json::from_str::<AgentJson>(slice).context("parse agent json")
+}
+
+fn compose_browser_login_reply(
+    reply: String,
+    browser_login_url: Option<&str>,
+    browser_login_instructions: Option<&str>,
+    browser_profile: Option<&str>,
+    browser: &crate::codex::BrowserEnvConfig,
+) -> String {
+    let mut out = String::new();
+
+    let base = reply.trim();
+    if base.is_empty() {
+        out.push_str("I hit an authentication step that needs manual browser login.");
+    } else {
+        out.push_str(base);
+    }
+
+    let profile_name = browser_profile
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or(&browser.profile_name);
+
+    let url = browser_login_url
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| {
+            if browser.novnc_enabled && !browser.novnc_url.is_empty() {
+                Some(browser.novnc_url.as_str())
+            } else {
+                None
+            }
+        });
+
+    out.push('\n');
+    out.push('\n');
+    out.push_str("Manual browser login is needed to continue:");
+    match url {
+        Some(novnc_url) => {
+            out.push_str(&format!("\n- Open: {novnc_url}"));
+        }
+        None => {
+            out.push_str("\n- NoVNC URL is not available in this environment.");
+        }
+    }
+    out.push_str(&format!("\n- Use browser profile: {profile_name}"));
+    out.push_str("\n- Finish the authentication flow in the browser and let me continue here when you are signed in.");
+    out.push_str("\n- Do not share credentials or OTP codes in chat; log in directly in the browser window.");
+
+    let instructions = browser_login_instructions
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or("Keep the browser session active so I can continue with the task.");
+    out.push('\n');
+    out.push_str(&format!("- Instructions: {instructions}"));
+
+    out
 }
 
 async fn repair_agent_output(

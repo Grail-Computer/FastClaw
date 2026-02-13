@@ -47,6 +47,10 @@ pub struct Config {
     #[arg(long, env = "WHATSAPP_VERIFY_TOKEN")]
     pub whatsapp_verify_token: Option<String>,
 
+    /// WhatsApp app secret for verifying X-Hub-Signature-256 webhook signatures.
+    #[arg(long, env = "WHATSAPP_APP_SECRET")]
+    pub whatsapp_app_secret: Option<String>,
+
     #[arg(long, env = "WHATSAPP_PHONE_NUMBER_ID")]
     pub whatsapp_phone_number_id: Option<String>,
 

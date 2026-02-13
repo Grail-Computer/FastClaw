@@ -48,6 +48,12 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
           slack_proactive_snippet,
           allow_telegram,
           telegram_allow_from,
+          allow_whatsapp,
+          whatsapp_allow_from,
+          allow_discord,
+          discord_allow_from,
+          allow_msteams,
+          msteams_allow_from,
           allow_slack_mcp,
           allow_web_mcp,
           extra_mcp_config,
@@ -93,6 +99,18 @@ pub async fn get_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
         allow_telegram: row.get::<i64, _>("allow_telegram") != 0,
         telegram_allow_from: row
             .get::<Option<String>, _>("telegram_allow_from")
+            .unwrap_or_default(),
+        allow_whatsapp: row.get::<i64, _>("allow_whatsapp") != 0,
+        whatsapp_allow_from: row
+            .get::<Option<String>, _>("whatsapp_allow_from")
+            .unwrap_or_default(),
+        allow_discord: row.get::<i64, _>("allow_discord") != 0,
+        discord_allow_from: row
+            .get::<Option<String>, _>("discord_allow_from")
+            .unwrap_or_default(),
+        allow_msteams: row.get::<i64, _>("allow_msteams") != 0,
+        msteams_allow_from: row
+            .get::<Option<String>, _>("msteams_allow_from")
             .unwrap_or_default(),
         allow_slack_mcp: row.get::<i64, _>("allow_slack_mcp") != 0,
         allow_web_mcp: row.get::<i64, _>("allow_web_mcp") != 0,
@@ -141,6 +159,12 @@ pub async fn update_settings(pool: &SqlitePool, settings: &Settings) -> anyhow::
             slack_proactive_snippet = ?,
             allow_telegram = ?,
             telegram_allow_from = ?,
+            allow_whatsapp = ?,
+            whatsapp_allow_from = ?,
+            allow_discord = ?,
+            discord_allow_from = ?,
+            allow_msteams = ?,
+            msteams_allow_from = ?,
             allow_slack_mcp = ?,
             allow_web_mcp = ?,
             extra_mcp_config = ?,
@@ -174,6 +198,12 @@ pub async fn update_settings(pool: &SqlitePool, settings: &Settings) -> anyhow::
     .bind(settings.slack_proactive_snippet.as_str())
     .bind(if settings.allow_telegram { 1 } else { 0 })
     .bind(settings.telegram_allow_from.as_str())
+    .bind(if settings.allow_whatsapp { 1 } else { 0 })
+    .bind(settings.whatsapp_allow_from.as_str())
+    .bind(if settings.allow_discord { 1 } else { 0 })
+    .bind(settings.discord_allow_from.as_str())
+    .bind(if settings.allow_msteams { 1 } else { 0 })
+    .bind(settings.msteams_allow_from.as_str())
     .bind(if settings.allow_slack_mcp { 1 } else { 0 })
     .bind(if settings.allow_web_mcp { 1 } else { 0 })
     .bind(settings.extra_mcp_config.as_str())
@@ -283,6 +313,25 @@ pub async fn try_mark_event_processed(
     .context("insert processed event")?;
 
     Ok(res.rows_affected() == 1)
+}
+
+pub async fn unmark_event_processed(
+    pool: &SqlitePool,
+    workspace_id: &str,
+    event_id: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM processed_events
+        WHERE workspace_id = ?1 AND event_id = ?2
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .context("delete processed event")?;
+    Ok(())
 }
 
 pub async fn enqueue_task(

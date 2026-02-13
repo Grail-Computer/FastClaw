@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     fonts-liberation \
     fonts-noto-color-emoji \
+    python3-pip \
     novnc \
     python3 \
     socat \
@@ -78,6 +79,8 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 COPY grail-browser-service.sh /usr/local/bin/grail-browser-service
 RUN chmod +x /usr/local/bin/grail-browser-service
+
+RUN python3 -m pip install --no-cache-dir --break-system-packages uv
 
 EXPOSE 3000 9222 5900 6080
 ENTRYPOINT ["/entrypoint.sh"]

@@ -252,6 +252,24 @@ pub async fn whatsapp_verify_token_configured(state: &AppState) -> anyhow::Resul
     Ok(load_whatsapp_verify_token_opt(state).await?.is_some())
 }
 
+pub async fn load_whatsapp_app_secret_opt(state: &AppState) -> anyhow::Result<Option<String>> {
+    if let Some(v) = state.config.whatsapp_app_secret.as_deref() {
+        if let Some(v) = normalize_nonempty(v.to_string()) {
+            return Ok(Some(v));
+        }
+    }
+    let Some(crypto) = state.crypto.as_deref() else {
+        return Ok(None);
+    };
+    let Some((nonce, ciphertext)) = db::read_secret(&state.pool, "whatsapp_app_secret").await?
+    else {
+        return Ok(None);
+    };
+    let plaintext = crypto.decrypt(b"whatsapp_app_secret", &nonce, &ciphertext)?;
+    let s = String::from_utf8(plaintext).context("WHATSAPP_APP_SECRET not valid utf-8")?;
+    Ok(normalize_nonempty(s))
+}
+
 pub async fn load_whatsapp_phone_number_id_opt(state: &AppState) -> anyhow::Result<Option<String>> {
     if let Some(v) = state.config.whatsapp_phone_number_id.as_deref() {
         if let Some(v) = normalize_nonempty(v.to_string()) {

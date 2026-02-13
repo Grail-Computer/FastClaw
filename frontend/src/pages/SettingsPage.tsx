@@ -248,6 +248,42 @@ export function SettingsPage() {
       </div>
 
       <div className="card">
+        <div className="card-title">WhatsApp</div>
+        <div className="form-checkbox-row">
+          <input type="checkbox" checked={data.allow_whatsapp} onChange={(e) => update('allow_whatsapp', e.target.checked)} />
+          <label className="form-label" style={{ margin: 0 }}>Enable WhatsApp</label>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Allow From (comma-separated phone numbers)</label>
+          <input className="form-input" value={data.whatsapp_allow_from} onChange={(e) => update('whatsapp_allow_from', e.target.value)} />
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-title">Discord</div>
+        <div className="form-checkbox-row">
+          <input type="checkbox" checked={data.allow_discord} onChange={(e) => update('allow_discord', e.target.checked)} />
+          <label className="form-label" style={{ margin: 0 }}>Enable Discord</label>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Allow From (comma-separated user IDs)</label>
+          <input className="form-input" value={data.discord_allow_from} onChange={(e) => update('discord_allow_from', e.target.value)} />
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-title">MS Teams</div>
+        <div className="form-checkbox-row">
+          <input type="checkbox" checked={data.allow_msteams} onChange={(e) => update('allow_msteams', e.target.checked)} />
+          <label className="form-label" style={{ margin: 0 }}>Enable MS Teams</label>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Allow From (comma-separated user IDs)</label>
+          <input className="form-input" value={data.msteams_allow_from} onChange={(e) => update('msteams_allow_from', e.target.value)} />
+        </div>
+      </div>
+
+      <div className="card">
         <div className="card-title">Web Tools</div>
         <div className="form-checkbox-row">
           <input type="checkbox" checked={data.allow_web_mcp} onChange={(e) => update('allow_web_mcp', e.target.checked)} />

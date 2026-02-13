@@ -10,22 +10,32 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::str::FromStr;
+use std::time::Duration;
 
 use crate::db;
 use crate::models::PermissionsMode;
 use crate::AppState;
+use crate::codex::BrowserEnvConfig;
 
 type ApiResult<T> = Result<Json<T>, crate::AppError>;
 
-fn env_bool(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "on" | "yes"))
-        .unwrap_or(false)
-}
+async fn is_browser_cdp_reachable(http: &reqwest::Client, cdp_url: &str) -> bool {
+    let mut url = match reqwest::Url::parse(cdp_url.trim()) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
 
-fn env_value(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+    let path = url.path().trim_end_matches('/');
+    if path.is_empty() {
+        url.set_path("/json/version");
+    } else if !path.ends_with("/json/version") {
+        url.set_path(&format!("{path}/json/version"));
+    }
+
+    match tokio::time::timeout(Duration::from_secs(2), http.get(url).send()).await {
+        Ok(Ok(resp)) => resp.status().is_success(),
+        _ => false,
+    }
 }
 
 // ─── Status ────────────────────────────────────────────────────────────────
@@ -61,22 +71,16 @@ pub async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
             .map(|b| format!("{}/{}", b.trim_end_matches('/'), suffix))
             .unwrap_or_else(|| format!("/{suffix}"))
     };
-    let browser_enabled = env_bool("GRAIL_BROWSER_ENABLED") || env_bool("OPENCLAW_BROWSER_ENABLED");
-    let browser_novnc_enabled = env_bool("GRAIL_BROWSER_ENABLE_NOVNC");
-    let browser_profile_name = {
-        let value = env_value("GRAIL_BROWSER_PROFILE_NAME", "default");
-        if value.trim().is_empty() {
-            "default".to_string()
-        } else {
-            value
-        }
-    };
-    let browser_cdp_port = env_value("GRAIL_BROWSER_CDP_PORT", "9222");
-    let browser_novnc_port = env_value("GRAIL_BROWSER_NOVNC_PORT", "6080");
-    let browser_novnc_url = if browser_enabled && browser_novnc_enabled {
-        format!("http://localhost:{}/vnc.html", browser_novnc_port)
+    let browser = BrowserEnvConfig::from_env();
+    let browser_novnc_url = if browser.enabled && browser.novnc_enabled {
+        browser.novnc_url.clone()
     } else {
         String::new()
+    };
+    let browser_cdp_reachable = if browser.enabled {
+        is_browser_cdp_reachable(&state.http, &browser.cdp_url).await
+    } else {
+        false
     };
 
     Ok(Json(json!({
@@ -96,11 +100,13 @@ pub async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         "active_task_started_at": active_task.as_ref().map(|(_, ts)| format!("{ts}")).unwrap_or_default(),
         "pending_approvals": pending_approvals,
         "guardrails_enabled": guardrails_enabled,
-        "browser_enabled": browser_enabled,
-        "browser_novnc_enabled": browser_novnc_enabled,
+        "browser_enabled": browser.enabled,
+        "browser_novnc_enabled": browser.novnc_enabled,
         "browser_novnc_url": browser_novnc_url,
-        "browser_profile_name": browser_profile_name,
-        "browser_cdp_port": browser_cdp_port,
+        "browser_cdp_url": browser.cdp_url,
+        "browser_cdp_reachable": browser_cdp_reachable,
+        "browser_profile_name": browser.profile_name,
+        "browser_cdp_port": browser.cdp_port,
     })))
 }
 
@@ -120,6 +126,12 @@ pub async fn api_settings_get(State(state): State<AppState>) -> ApiResult<Value>
         "slack_proactive_snippet": s.slack_proactive_snippet,
         "allow_telegram": s.allow_telegram,
         "telegram_allow_from": s.telegram_allow_from,
+        "allow_whatsapp": s.allow_whatsapp,
+        "whatsapp_allow_from": s.whatsapp_allow_from,
+        "allow_discord": s.allow_discord,
+        "discord_allow_from": s.discord_allow_from,
+        "allow_msteams": s.allow_msteams,
+        "msteams_allow_from": s.msteams_allow_from,
         "allow_slack_mcp": s.allow_slack_mcp,
         "allow_web_mcp": s.allow_web_mcp,
         "extra_mcp_config": s.extra_mcp_config,
@@ -157,6 +169,12 @@ pub struct ApiSettingsPost {
     pub slack_proactive_snippet: Option<String>,
     pub allow_telegram: Option<bool>,
     pub telegram_allow_from: Option<String>,
+    pub allow_whatsapp: Option<bool>,
+    pub whatsapp_allow_from: Option<String>,
+    pub allow_discord: Option<bool>,
+    pub discord_allow_from: Option<String>,
+    pub allow_msteams: Option<bool>,
+    pub msteams_allow_from: Option<String>,
     pub allow_slack_mcp: Option<bool>,
     pub allow_web_mcp: Option<bool>,
     pub extra_mcp_config: Option<String>,
@@ -213,6 +231,24 @@ pub async fn api_settings_post(
     }
     if let Some(v) = form.telegram_allow_from {
         s.telegram_allow_from = v;
+    }
+    if let Some(v) = form.allow_whatsapp {
+        s.allow_whatsapp = v;
+    }
+    if let Some(v) = form.whatsapp_allow_from {
+        s.whatsapp_allow_from = v;
+    }
+    if let Some(v) = form.allow_discord {
+        s.allow_discord = v;
+    }
+    if let Some(v) = form.discord_allow_from {
+        s.discord_allow_from = v;
+    }
+    if let Some(v) = form.allow_msteams {
+        s.allow_msteams = v;
+    }
+    if let Some(v) = form.msteams_allow_from {
+        s.msteams_allow_from = v;
     }
     if let Some(v) = form.allow_slack_mcp {
         s.allow_slack_mcp = v;

@@ -112,6 +112,8 @@ export interface StatusData {
   browser_enabled: boolean;
   browser_novnc_enabled: boolean;
   browser_novnc_url: string;
+  browser_cdp_url: string;
+  browser_cdp_reachable: boolean;
   browser_profile_name: string;
   browser_cdp_port: string;
 }
@@ -128,6 +130,12 @@ export interface SettingsData {
   slack_proactive_snippet: string;
   allow_telegram: boolean;
   telegram_allow_from: string;
+  allow_whatsapp: boolean;
+  whatsapp_allow_from: string;
+  allow_discord: boolean;
+  discord_allow_from: string;
+  allow_msteams: boolean;
+  msteams_allow_from: string;
   allow_slack_mcp: boolean;
   allow_web_mcp: boolean;
   extra_mcp_config: string;

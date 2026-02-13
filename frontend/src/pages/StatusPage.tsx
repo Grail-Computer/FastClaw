@@ -110,6 +110,16 @@ export function StatusPage() {
             </div>
           </div>
           <div className="kv-item">
+            <div className="kv-label">CDP Endpoint</div>
+            <div className="kv-value" style={{ wordBreak: 'break-word' }}>
+              {data.browser_cdp_url || `http://127.0.0.1:${data.browser_cdp_port}`}
+            </div>
+          </div>
+          <div className="kv-item">
+            <div className="kv-label">CDP Reachability</div>
+            <div className="kv-value">{statusPill(data.browser_cdp_reachable, 'Reachable', 'Unreachable')}</div>
+          </div>
+          <div className="kv-item">
             <div className="kv-label">Profile</div>
             <div className="kv-value">{data.browser_profile_name || 'default'}</div>
           </div>

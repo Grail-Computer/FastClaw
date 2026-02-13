@@ -23,6 +23,7 @@ guardrails/
 # Local agent scratch/skills (do not commit)
 .agent/
 frontend/node_modules/*
+frontend/dist/
 **/*.tsbuildinfo
 .DS_Store
 
