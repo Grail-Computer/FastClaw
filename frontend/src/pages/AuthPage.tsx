@@ -36,6 +36,8 @@ export function AuthPage() {
           <div className="kv-item"><div className="kv-label">OpenAI API Key</div><div className="kv-value">{boolPill(data.openai_api_key_set)}</div></div>
           <div className="kv-item"><div className="kv-label">Codex Auth File</div><div className="kv-value">{boolPill(data.codex_auth_file_set)}</div></div>
           <div className="kv-item"><div className="kv-label">Auth Mode</div><div className="kv-value">{data.codex_auth_mode}</div></div>
+          <div className="kv-item"><div className="kv-label">GitHub Client ID</div><div className="kv-value">{boolPill(data.github_client_id_set)}</div></div>
+          <div className="kv-item"><div className="kv-label">GitHub Token</div><div className="kv-value">{boolPill(data.github_token_set)}</div></div>
         </div>
       </div>
       <div className="card">
@@ -50,7 +52,25 @@ export function AuthPage() {
           <button className="btn btn-primary" onClick={() => { api.startDeviceLogin().then(load); }}>Start Device Login</button>
         )}
       </div>
-      <button className="btn btn-danger" style={{ marginTop: 16 }} onClick={() => { api.authLogout().then(load); }}>Logout</button>
+      <div className="card">
+        <div className="card-title">GitHub Device Login</div>
+        {!data.github_client_id_set && (
+          <p style={{ fontSize: 13, color: 'var(--muted)' }}>
+            Set <code>GITHUB_CLIENT_ID</code> in the environment to enable GitHub device login.
+          </p>
+        )}
+        {data.github_device_login ? (
+          <>
+            <p style={{ fontSize: 13 }}>Status: <strong>{data.github_device_login.status}</strong> — Code: <code>{data.github_device_login.user_code}</code></p>
+            {data.github_device_login.verification_url && <p><a href={data.github_device_login.verification_url} target="_blank" rel="noreferrer">Open verification URL</a></p>}
+            <button className="btn btn-danger btn-sm" onClick={() => { api.cancelGithubDeviceLogin().then(load); }}>Cancel</button>
+          </>
+        ) : (
+          <button className="btn btn-primary" disabled={!data.github_client_id_set} onClick={() => { api.startGithubDeviceLogin().then(load); }}>Start GitHub Device Login</button>
+        )}
+        <button className="btn btn-danger btn-sm" style={{ marginTop: 10 }} onClick={() => { api.githubLogout().then(load); }}>Logout (Delete token)</button>
+      </div>
+      <button className="btn btn-danger" style={{ marginTop: 16 }} onClick={() => { api.authLogout().then(load); }}>Logout (Delete Codex auth)</button>
     </>
   );
 }

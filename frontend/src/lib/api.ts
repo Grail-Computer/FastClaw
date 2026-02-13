@@ -74,6 +74,9 @@ export const api = {
   startDeviceLogin: () => request<{ ok: boolean }>('/auth/device/start', { method: 'POST' }),
   cancelDeviceLogin: () => request<{ ok: boolean }>('/auth/device/cancel', { method: 'POST' }),
   authLogout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
+  startGithubDeviceLogin: () => request<{ ok: boolean }>('/auth/github/device/start', { method: 'POST' }),
+  cancelGithubDeviceLogin: () => request<{ ok: boolean }>('/auth/github/device/cancel', { method: 'POST' }),
+  githubLogout: () => request<{ ok: boolean }>('/auth/github/logout', { method: 'POST' }),
 
   // Diagnostics
   getDiagnostics: () => request<DiagnosticsData>('/diagnostics'),
@@ -228,6 +231,15 @@ export interface AuthData {
   codex_auth_file_set: boolean;
   codex_auth_mode: string;
   device_login?: {
+    status: string;
+    verification_url: string;
+    user_code: string;
+    error_text: string;
+    created_at: string;
+  };
+  github_client_id_set: boolean;
+  github_token_set: boolean;
+  github_device_login?: {
     status: string;
     verification_url: string;
     user_code: string;
