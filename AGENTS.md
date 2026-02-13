@@ -1,8 +1,8 @@
-# AGENTS.md — Grail (MicroEmployee)
+# AGENTS.md — FastClaw
 
 ## What This Is
 
-Grail is a **Slack/Telegram bot** backed by an autonomous AI agent (OpenAI Codex CLI). It receives messages from Slack or Telegram, queues them as tasks in a SQLite database, runs Codex in a sandboxed subprocess to produce answers, and posts the results back. It ships with an admin dashboard for configuration, monitoring, and approvals.
+FastClaw is a **Slack/Telegram bot** backed by an autonomous AI agent (OpenAI Codex CLI). It receives messages from Slack or Telegram, queues them as tasks in a SQLite database, runs Codex in a sandboxed subprocess to produce answers, and posts the results back. It ships with an admin dashboard for configuration, monitoring, and approvals.
 
 **Production deployment**: Railway (Docker).
 
@@ -11,7 +11,7 @@ Grail is a **Slack/Telegram bot** backed by an autonomous AI agent (OpenAI Codex
 ## Repo Layout
 
 ```
-MicroEmployee/
+FastClaw/
 ├── grail/                      # Main Rust workspace (this is the product)
 │   ├── Cargo.toml              # Workspace root
 │   └── crates/

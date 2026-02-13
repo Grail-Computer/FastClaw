@@ -1,20 +1,25 @@
-# Grail - Your MicroEmployee
+<table>
+  <tr>
+    <td><img src="mascot.png" alt="FastClaw Mascot" width="128"></td>
+    <td><h1>FastClaw — AI Teammate</h1></td>
+  </tr>
+</table>
 
-Grail is a single-tenant “micro employee” you deploy as a service and connect to Slack and/or Telegram.
+FastClaw is a single-tenant AI teammate platform you deploy as a service and connect to Slack and/or Telegram. The default in-chat agent name remains Grail.
 
 In Slack, you can mention it:
 
 `@Grail do so and so`
 
-In Telegram (DM or group), you can address it via `/microemployee ...` (or @mention in groups).
+In Telegram (DM or group), you can address it via `/grail ...` (or @mention in groups).
 
 ## Demo
 
-![Grail demo](assets/demo/grail-demo.gif)
+![FastClaw demo](assets/demo/grail-demo.gif)
 
-Re-record the assets: see the `MicroEmployee-Demo-Video` repo.
+Re-record the assets: see the `FastClaw-Demo-Video` repo.
 
-## These Are The Things Grail Can Do
+## These Are The Things FastClaw Can Do
 
 1. Recap long threads into action items (and attach a markdown report).
    - ![Thread recap](assets/demo/variants/grail-v01-thread-recap.gif)
@@ -27,7 +32,7 @@ Re-record the assets: see the `MicroEmployee-Demo-Video` repo.
 5. Safely run operational commands with guardrails and in-Slack approvals.
    - ![Guardrail approval](assets/demo/variants/grail-v08-guardrail-approval.gif)
 
-Grail will:
+FastClaw will:
 
 - Acknowledge quickly (queues a job).
 - Inject the last **N** recent messages as context (configurable).
@@ -95,7 +100,7 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
   -d "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
 ```
 
-Telegram history note: the Bot API can’t fetch arbitrary chat history, so Grail injects Telegram context from messages it has previously received (stored in SQLite).
+Telegram history note: the Bot API can’t fetch arbitrary chat history, so FastClaw injects Telegram context from messages it has previously received (stored in SQLite).
 
 ## Dashboard
 
@@ -131,7 +136,7 @@ Telegram secrets can also be stored the same way.
 
 Mount a volume at `/data`.
 
-Grail stores:
+FastClaw stores:
 
 - `/data/grail.sqlite` (queue, settings, session mapping)
 - `/data/context/` (durable notes)
@@ -143,7 +148,7 @@ Grail stores:
 - `read`: no command execution; no context writes.
 - `full`: command execution is allowed (with sandboxing); context writes allowed (restricted to `/data/context`).
 
-Even in `read`, Grail can respond and (optionally) use Slack MCP tools to fetch more Slack context.
+Even in `read`, FastClaw can respond and (optionally) use Slack MCP tools to fetch more Slack context.
 
 ## Local Development
 
@@ -166,6 +171,6 @@ cargo run -p grail-server
 
 ## Custom Development
 
-Need a tailored agent setup, custom integrations, or help deploying MicroEmployee for your team? We build custom AI infrastructure.
+Need a tailored agent setup, custom integrations, or help deploying FastClaw for your team? We build custom AI infrastructure.
 
 Reach out: **yash@grail.computer**

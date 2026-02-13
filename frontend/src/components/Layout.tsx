@@ -19,7 +19,7 @@ export function Layout() {
   return (
     <div className="app-shell">
       <header className="app-topbar">
-        <span className="app-brand">Grail</span>
+        <span className="app-brand">FastClaw</span>
         <nav className="app-nav">
           {NAV_ITEMS.map((item) => (
             <NavLink
