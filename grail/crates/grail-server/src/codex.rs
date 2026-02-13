@@ -25,6 +25,14 @@ struct CodexProc {
     next_id: u64,
 }
 
+impl Drop for CodexProc {
+    fn drop(&mut self) {
+        // If a worker task is aborted/dropped without calling CodexManager::stop(),
+        // ensure the subprocess doesn't leak.
+        let _ = self.child.start_kill();
+    }
+}
+
 pub struct CodexManager {
     config: Arc<Config>,
     proc: Option<CodexProc>,
@@ -604,7 +612,7 @@ async fn spawn_codex_with_args(
             json!({
                 "clientInfo": {
                     "name": "grail",
-                    "title": "Grail",
+                    "title": "FastClaw",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "capabilities": null

@@ -6,8 +6,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::models::{
-    Approval, CodexDeviceLogin, CronJob, GuardrailRule, PermissionsMode, Session, Settings, Task,
-    TelegramMessage,
+    Approval, CodexDeviceLogin, CronJob, GithubDeviceLogin, GuardrailRule, ObservationalMemory,
+    PermissionsMode, Session, Settings, Task, TelegramMessage,
 };
 
 pub async fn init_sqlite(db_path: &Path) -> anyhow::Result<SqlitePool> {
@@ -18,7 +18,8 @@ pub async fn init_sqlite(db_path: &Path) -> anyhow::Result<SqlitePool> {
         .busy_timeout(Duration::from_secs(5));
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        // Allow concurrent task processing + webhooks without starving DB access.
+        .max_connections(20)
         .connect_with(options)
         .await
         .with_context(|| format!("connect sqlite at {}", db_path.display()))?;
@@ -315,6 +316,8 @@ pub async fn enqueue_task_with_files(
     files_json: &str,
     is_proactive: bool,
 ) -> anyhow::Result<i64> {
+    let conversation_key =
+        compute_conversation_key(workspace_id, channel_id, thread_ts, event_ts, is_proactive);
     let res = sqlx::query(
         r#"
         INSERT INTO tasks (
@@ -323,6 +326,7 @@ pub async fn enqueue_task_with_files(
           workspace_id,
           channel_id,
           thread_ts,
+          conversation_key,
           event_ts,
           requested_by_user_id,
           prompt_text,
@@ -330,13 +334,14 @@ pub async fn enqueue_task_with_files(
           is_proactive,
           created_at
         )
-        VALUES (?1, 'queued', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch())
+        VALUES (?1, 'queued', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch())
         "#,
     )
     .bind(provider)
     .bind(workspace_id)
     .bind(channel_id)
     .bind(thread_ts)
+    .bind(&conversation_key)
     .bind(event_ts)
     .bind(requested_by_user_id)
     .bind(prompt_text)
@@ -347,6 +352,26 @@ pub async fn enqueue_task_with_files(
     .context("insert task")?;
 
     Ok(res.last_insert_rowid())
+}
+
+fn compute_conversation_key(
+    workspace_id: &str,
+    channel_id: &str,
+    thread_ts: &str,
+    event_ts: &str,
+    is_proactive: bool,
+) -> String {
+    // Mirror worker::conversation_key_for_task so the DB row is stable and usable for locking.
+    let thread_ts = thread_ts.trim();
+    let event_ts = event_ts.trim();
+    if is_proactive && !thread_ts.is_empty() {
+        return format!("{workspace_id}:{channel_id}:thread:{thread_ts}");
+    }
+    if !thread_ts.is_empty() && thread_ts != event_ts {
+        format!("{workspace_id}:{channel_id}:thread:{thread_ts}")
+    } else {
+        format!("{workspace_id}:{channel_id}:main")
+    }
 }
 
 pub async fn list_cron_jobs(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<CronJob>> {
@@ -968,7 +993,73 @@ pub async fn get_runtime_active_task(pool: &SqlitePool) -> anyhow::Result<Option
     }))
 }
 
-pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> {
+pub async fn clear_runtime_active_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM runtime_active_tasks")
+        .execute(pool)
+        .await
+        .context("clear runtime active tasks")?;
+    Ok(res.rows_affected())
+}
+
+pub async fn mark_task_active(pool: &SqlitePool, task_id: i64) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO runtime_active_tasks (task_id, started_at, updated_at)
+        VALUES (?1, unixepoch(), unixepoch())
+        ON CONFLICT(task_id) DO UPDATE SET
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(task_id)
+    .execute(pool)
+    .await
+    .context("mark task active")?;
+    Ok(())
+}
+
+pub async fn mark_task_inactive(pool: &SqlitePool, task_id: i64) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM runtime_active_tasks WHERE task_id = ?1")
+        .bind(task_id)
+        .execute(pool)
+        .await
+        .context("mark task inactive")?;
+    Ok(())
+}
+
+pub async fn list_active_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<(i64, i64)>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT task_id, started_at
+        FROM runtime_active_tasks
+        ORDER BY started_at ASC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("list active tasks")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<i64, _>("task_id"), r.get::<i64, _>("started_at")))
+        .collect())
+}
+
+pub async fn count_active_tasks(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS c FROM runtime_active_tasks")
+        .fetch_one(pool)
+        .await
+        .context("count active tasks")?;
+    Ok(row.get::<i64, _>("c"))
+}
+
+pub async fn claim_next_task(
+    pool: &SqlitePool,
+    owner_id: &str,
+    lease_seconds: i64,
+) -> anyhow::Result<Option<Task>> {
+    anyhow::ensure!(lease_seconds >= 10, "lease_seconds too small");
     let mut tx = pool.begin().await.context("begin tx")?;
 
     let row_opt = sqlx::query(
@@ -981,6 +1072,7 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
           workspace_id,
           channel_id,
           thread_ts,
+          conversation_key,
           event_ts,
           requested_by_user_id,
           prompt_text,
@@ -992,6 +1084,13 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
           finished_at
         FROM tasks
         WHERE status = 'queued'
+          AND conversation_key != ''
+          AND NOT EXISTS (
+            SELECT 1
+            FROM conversation_locks l
+            WHERE l.conversation_key = tasks.conversation_key
+              AND l.lease_until >= unixepoch()
+          )
         ORDER BY created_at ASC, id ASC
         LIMIT 1
         "#,
@@ -1025,6 +1124,26 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
         return Ok(None);
     }
 
+    // Acquire a per-conversation lease lock so concurrent workers don't process the same
+    // conversation simultaneously.
+    let conversation_key = row.get::<String, _>("conversation_key");
+    sqlx::query(
+        r#"
+        INSERT INTO conversation_locks (conversation_key, owner_id, lease_until, updated_at)
+        VALUES (?1, ?2, unixepoch() + ?3, unixepoch())
+        ON CONFLICT(conversation_key) DO UPDATE SET
+          owner_id = excluded.owner_id,
+          lease_until = excluded.lease_until,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&conversation_key)
+    .bind(owner_id)
+    .bind(lease_seconds)
+    .execute(&mut *tx)
+    .await
+    .context("acquire conversation lock")?;
+
     tx.commit().await.context("commit tx")?;
 
     Ok(Some(Task {
@@ -1037,6 +1156,7 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
         workspace_id: row.get::<String, _>("workspace_id"),
         channel_id: row.get::<String, _>("channel_id"),
         thread_ts: row.get::<String, _>("thread_ts"),
+        conversation_key,
         event_ts: row.get::<String, _>("event_ts"),
         requested_by_user_id: row.get::<String, _>("requested_by_user_id"),
         prompt_text: row.get::<String, _>("prompt_text"),
@@ -1047,6 +1167,67 @@ pub async fn claim_next_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> 
         started_at: Some(chrono::Utc::now().timestamp()),
         finished_at: row.get::<Option<i64>, _>("finished_at"),
     }))
+}
+
+pub async fn try_renew_conversation_lock(
+    pool: &SqlitePool,
+    conversation_key: &str,
+    owner_id: &str,
+    lease_seconds: i64,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(lease_seconds >= 10, "lease_seconds too small");
+    let res = sqlx::query(
+        r#"
+        UPDATE conversation_locks
+        SET lease_until = unixepoch() + ?3,
+            updated_at = unixepoch()
+        WHERE conversation_key = ?1
+          AND owner_id = ?2
+        "#,
+    )
+    .bind(conversation_key)
+    .bind(owner_id)
+    .bind(lease_seconds)
+    .execute(pool)
+    .await
+    .context("renew conversation lock")?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub async fn release_conversation_lock(
+    pool: &SqlitePool,
+    conversation_key: &str,
+    owner_id: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM conversation_locks
+        WHERE conversation_key = ?1
+          AND owner_id = ?2
+        "#,
+    )
+    .bind(conversation_key)
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .context("release conversation lock")?;
+    Ok(())
+}
+
+pub async fn cleanup_expired_conversation_locks(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM conversation_locks WHERE lease_until < unixepoch()")
+        .execute(pool)
+        .await
+        .context("cleanup expired conversation locks")?;
+    Ok(res.rows_affected())
+}
+
+pub async fn clear_all_conversation_locks(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM conversation_locks")
+        .execute(pool)
+        .await
+        .context("clear conversation locks")?;
+    Ok(res.rows_affected())
 }
 
 pub async fn reset_running_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
@@ -1297,6 +1478,157 @@ pub async fn update_codex_device_login_status(
     Ok(())
 }
 
+pub async fn cancel_pending_github_device_logins(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let res = sqlx::query(
+        r#"
+        UPDATE github_device_logins
+        SET status = 'cancelled',
+            completed_at = unixepoch()
+        WHERE status = 'pending'
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("cancel pending github device logins")?;
+    Ok(res.rows_affected())
+}
+
+pub async fn insert_github_device_login(
+    pool: &SqlitePool,
+    login: &GithubDeviceLogin,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO github_device_logins (
+          id,
+          status,
+          verification_url,
+          user_code,
+          device_code,
+          interval_sec,
+          error_text,
+          created_at,
+          completed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&login.id)
+    .bind(&login.status)
+    .bind(&login.verification_url)
+    .bind(&login.user_code)
+    .bind(&login.device_code)
+    .bind(login.interval_sec)
+    .bind(login.error_text.as_deref())
+    .bind(login.created_at)
+    .bind(login.completed_at)
+    .execute(pool)
+    .await
+    .context("insert github device login")?;
+    Ok(())
+}
+
+pub async fn get_github_device_login(
+    pool: &SqlitePool,
+    id: &str,
+) -> anyhow::Result<Option<GithubDeviceLogin>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          id,
+          status,
+          verification_url,
+          user_code,
+          device_code,
+          interval_sec,
+          error_text,
+          created_at,
+          completed_at
+        FROM github_device_logins
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("select github device login")?;
+
+    Ok(row.map(|r| GithubDeviceLogin {
+        id: r.get::<String, _>("id"),
+        status: r.get::<String, _>("status"),
+        verification_url: r.get::<String, _>("verification_url"),
+        user_code: r.get::<String, _>("user_code"),
+        device_code: r.get::<String, _>("device_code"),
+        interval_sec: r.get::<i64, _>("interval_sec"),
+        error_text: r.get::<Option<String>, _>("error_text"),
+        created_at: r.get::<i64, _>("created_at"),
+        completed_at: r.get::<Option<i64>, _>("completed_at"),
+    }))
+}
+
+pub async fn get_latest_github_device_login(
+    pool: &SqlitePool,
+) -> anyhow::Result<Option<GithubDeviceLogin>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          id,
+          status,
+          verification_url,
+          user_code,
+          device_code,
+          interval_sec,
+          error_text,
+          created_at,
+          completed_at
+        FROM github_device_logins
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .context("select latest github device login")?;
+
+    Ok(row.map(|r| GithubDeviceLogin {
+        id: r.get::<String, _>("id"),
+        status: r.get::<String, _>("status"),
+        verification_url: r.get::<String, _>("verification_url"),
+        user_code: r.get::<String, _>("user_code"),
+        device_code: r.get::<String, _>("device_code"),
+        interval_sec: r.get::<i64, _>("interval_sec"),
+        error_text: r.get::<Option<String>, _>("error_text"),
+        created_at: r.get::<i64, _>("created_at"),
+        completed_at: r.get::<Option<i64>, _>("completed_at"),
+    }))
+}
+
+pub async fn update_github_device_login_status(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    error_text: Option<&str>,
+    completed_at: Option<i64>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE github_device_logins
+        SET status = ?2,
+            error_text = ?3,
+            completed_at = ?4
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .bind(status)
+    .bind(error_text)
+    .bind(completed_at)
+    .execute(pool)
+    .await
+    .context("update github device login status")?;
+    Ok(())
+}
+
 pub async fn complete_task_success(
     pool: &SqlitePool,
     task_id: i64,
@@ -1391,6 +1723,7 @@ pub async fn list_recent_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<
           workspace_id,
           channel_id,
           thread_ts,
+          conversation_key,
           event_ts,
           requested_by_user_id,
           prompt_text,
@@ -1422,6 +1755,7 @@ pub async fn list_recent_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<
             workspace_id: row.get::<String, _>("workspace_id"),
             channel_id: row.get::<String, _>("channel_id"),
             thread_ts: row.get::<String, _>("thread_ts"),
+            conversation_key: row.get::<String, _>("conversation_key"),
             event_ts: row.get::<String, _>("event_ts"),
             requested_by_user_id: row.get::<String, _>("requested_by_user_id"),
             prompt_text: row.get::<String, _>("prompt_text"),
@@ -1597,5 +1931,179 @@ pub async fn delete_session(pool: &SqlitePool, conversation_key: &str) -> anyhow
         .execute(pool)
         .await
         .context("delete session")?;
+    Ok(res.rows_affected() == 1)
+}
+
+// ─── Observational Memory ──────────────────────────────────────────────────
+
+pub async fn get_observational_memory(
+    pool: &SqlitePool,
+    memory_key: &str,
+) -> anyhow::Result<Option<ObservationalMemory>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          memory_key,
+          scope,
+          observation_log,
+          reflection_summary,
+          updated_at
+        FROM observational_memory
+        WHERE memory_key = ?1
+        "#,
+    )
+    .bind(memory_key)
+    .fetch_optional(pool)
+    .await
+    .context("select observational memory")?;
+
+    Ok(row.map(|r| ObservationalMemory {
+        memory_key: r.get::<String, _>("memory_key"),
+        scope: r.get::<String, _>("scope"),
+        observation_log: r.get::<String, _>("observation_log"),
+        reflection_summary: r.get::<String, _>("reflection_summary"),
+        updated_at: r.get::<i64, _>("updated_at"),
+    }))
+}
+
+pub async fn upsert_observational_memory(
+    pool: &SqlitePool,
+    mem: &ObservationalMemory,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO observational_memory (
+          memory_key,
+          scope,
+          observation_log,
+          reflection_summary,
+          updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, unixepoch())
+        ON CONFLICT(memory_key) DO UPDATE SET
+          scope = excluded.scope,
+          observation_log = excluded.observation_log,
+          reflection_summary = excluded.reflection_summary,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&mem.memory_key)
+    .bind(&mem.scope)
+    .bind(&mem.observation_log)
+    .bind(&mem.reflection_summary)
+    .execute(pool)
+    .await
+    .context("upsert observational memory")?;
+    Ok(())
+}
+
+pub async fn append_observational_memory(
+    pool: &SqlitePool,
+    memory_key: &str,
+    scope: &str,
+    append_text: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO observational_memory (
+          memory_key,
+          scope,
+          observation_log,
+          reflection_summary,
+          updated_at
+        )
+        VALUES (?1, ?2, ?3, '', unixepoch())
+        ON CONFLICT(memory_key) DO UPDATE SET
+          scope = excluded.scope,
+          observation_log = observation_log || excluded.observation_log,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(memory_key)
+    .bind(scope)
+    .bind(append_text)
+    .execute(pool)
+    .await
+    .context("append observational memory")?;
+    Ok(())
+}
+
+pub async fn set_observational_memory(
+    pool: &SqlitePool,
+    memory_key: &str,
+    scope: &str,
+    observation_log: &str,
+    reflection_summary: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO observational_memory (
+          memory_key,
+          scope,
+          observation_log,
+          reflection_summary,
+          updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, unixepoch())
+        ON CONFLICT(memory_key) DO UPDATE SET
+          scope = excluded.scope,
+          observation_log = excluded.observation_log,
+          reflection_summary = excluded.reflection_summary,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(memory_key)
+    .bind(scope)
+    .bind(observation_log)
+    .bind(reflection_summary)
+    .execute(pool)
+    .await
+    .context("set observational memory")?;
+    Ok(())
+}
+
+pub async fn list_observational_memory(
+    pool: &SqlitePool,
+    limit: i64,
+) -> anyhow::Result<Vec<ObservationalMemory>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          memory_key,
+          scope,
+          observation_log,
+          reflection_summary,
+          updated_at
+        FROM observational_memory
+        ORDER BY updated_at DESC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("list observational memory")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ObservationalMemory {
+            memory_key: r.get::<String, _>("memory_key"),
+            scope: r.get::<String, _>("scope"),
+            observation_log: r.get::<String, _>("observation_log"),
+            reflection_summary: r.get::<String, _>("reflection_summary"),
+            updated_at: r.get::<i64, _>("updated_at"),
+        })
+        .collect())
+}
+
+pub async fn delete_observational_memory(
+    pool: &SqlitePool,
+    memory_key: &str,
+) -> anyhow::Result<bool> {
+    let res = sqlx::query("DELETE FROM observational_memory WHERE memory_key = ?1")
+        .bind(memory_key)
+        .execute(pool)
+        .await
+        .context("delete observational memory")?;
     Ok(res.rows_affected() == 1)
 }

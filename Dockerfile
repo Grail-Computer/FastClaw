@@ -30,6 +30,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    git \
     gosu \
     tar \
     && rm -rf /var/lib/apt/lists/*

@@ -44,6 +44,11 @@ pub struct Config {
     /// Optional base URL used when rendering links in the dashboard.
     #[arg(long, env = "BASE_URL")]
     pub base_url: Option<String>,
+
+    /// Max number of tasks to process concurrently (across different conversations).
+    /// Each worker slot maintains its own Codex app-server subprocess.
+    #[arg(long, env = "GRAIL_WORKER_CONCURRENCY", default_value = "2")]
+    pub worker_concurrency: usize,
 }
 
 impl Config {

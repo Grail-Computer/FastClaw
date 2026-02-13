@@ -64,6 +64,7 @@ pub struct Task {
     pub workspace_id: String,
     pub channel_id: String,
     pub thread_ts: String,
+    pub conversation_key: String,
     pub event_ts: String,
     pub requested_by_user_id: String,
     pub prompt_text: String,
@@ -84,12 +85,34 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone)]
+pub struct ObservationalMemory {
+    pub memory_key: String,
+    pub scope: String, // thread | resource
+    pub observation_log: String,
+    pub reflection_summary: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct CodexDeviceLogin {
     pub id: String,
     pub status: String,
     pub verification_url: String,
     pub user_code: String,
     pub device_auth_id: String,
+    pub interval_sec: i64,
+    pub error_text: Option<String>,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GithubDeviceLogin {
+    pub id: String,
+    pub status: String,
+    pub verification_url: String,
+    pub user_code: String,
+    pub device_code: String,
     pub interval_sec: i64,
     pub error_text: Option<String>,
     pub created_at: i64,

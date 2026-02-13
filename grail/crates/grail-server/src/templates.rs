@@ -99,6 +99,9 @@ pub struct AuthTemplate {
     pub codex_auth_file_set: bool,
     pub codex_auth_mode: String,
     pub device_login: Option<DeviceLoginRow>,
+    pub github_client_id_set: bool,
+    pub github_token_set: bool,
+    pub github_device_login: Option<DeviceLoginRow>,
 }
 
 #[derive(Template)]

@@ -28,7 +28,10 @@ pub async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
     let worker_lock_owner = db::get_worker_lock_owner(&state.pool)
         .await?
         .unwrap_or_default();
-    let active_task = db::get_runtime_active_task(&state.pool).await?;
+    let active_task = db::list_active_tasks(&state.pool, 1)
+        .await?
+        .into_iter()
+        .next();
     let pending_approvals: i64 =
         sqlx::query("SELECT COUNT(*) AS c FROM approvals WHERE status = 'pending'")
             .fetch_one(&state.pool)
@@ -692,11 +695,31 @@ pub async fn api_auth_get(State(state): State<AppState>) -> ApiResult<Value> {
             "created_at": format!("{}", l.created_at),
         })
     });
+
+    let github_latest = db::get_latest_github_device_login(&state.pool).await?;
+    let github_device_login = github_latest.map(|l| {
+        json!({
+            "status": l.status,
+            "verification_url": l.verification_url,
+            "user_code": l.user_code,
+            "error_text": l.error_text.unwrap_or_default(),
+            "created_at": format!("{}", l.created_at),
+        })
+    });
+    let github_client_id_set = std::env::var("GITHUB_CLIENT_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .is_some();
+
     Ok(Json(json!({
         "openai_api_key_set": crate::secrets::openai_api_key_configured(&state).await.unwrap_or(false),
         "codex_auth_file_set": auth_summary.file_present,
         "codex_auth_mode": auth_summary.auth_mode,
         "device_login": device_login,
+        "github_client_id_set": github_client_id_set,
+        "github_token_set": crate::secrets::github_token_configured(&state).await.unwrap_or(false),
+        "github_device_login": github_device_login,
     })))
 }
 
@@ -758,6 +781,88 @@ pub async fn api_auth_logout(State(state): State<AppState>) -> ApiResult<Value> 
     let codex_home = state.config.effective_codex_home();
     let _ = crate::codex_login::delete_auth_json(&codex_home).await?;
     let _ = db::cancel_pending_codex_device_logins(&state.pool).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+pub async fn api_github_device_start(State(state): State<AppState>) -> ApiResult<Value> {
+    let _ = db::cancel_pending_github_device_logins(&state.pool).await;
+
+    let client_id = std::env::var("GITHUB_CLIENT_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .context("GITHUB_CLIENT_ID is not configured")?;
+    let scope = std::env::var("GITHUB_OAUTH_SCOPE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build http")?;
+
+    let dc = crate::github_login::request_device_code(
+        &http,
+        crate::github_login::DEFAULT_GITHUB_BASE,
+        &client_id,
+        &scope,
+    )
+    .await?;
+
+    let verification_url = dc
+        .verification_url_complete
+        .clone()
+        .unwrap_or_else(|| dc.verification_url.clone());
+
+    let id = crate::random_id("github_device_login");
+    let login = crate::models::GithubDeviceLogin {
+        id: id.clone(),
+        status: "pending".to_string(),
+        verification_url,
+        user_code: dc.user_code.clone(),
+        device_code: dc.device_code.clone(),
+        interval_sec: dc.interval_sec as i64,
+        error_text: None,
+        created_at: chrono::Utc::now().timestamp(),
+        completed_at: None,
+    };
+    db::insert_github_device_login(&state.pool, &login).await?;
+
+    let pool = state.pool.clone();
+    let crypto = state.crypto.clone();
+    let data_dir = state.config.data_dir.clone();
+    let base = crate::github_login::DEFAULT_GITHUB_BASE.to_string();
+    tokio::spawn(async move {
+        let _ = crate::run_github_device_login_flow(
+            pool,
+            id,
+            crypto,
+            data_dir,
+            base,
+            client_id,
+            dc.device_code,
+            dc.interval_sec,
+            dc.expires_in_sec,
+        )
+        .await;
+    });
+
+    Ok(Json(json!({"ok": true})))
+}
+
+pub async fn api_github_device_cancel(State(state): State<AppState>) -> ApiResult<Value> {
+    db::cancel_pending_github_device_logins(&state.pool).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+pub async fn api_github_logout(State(state): State<AppState>) -> ApiResult<Value> {
+    let _ = db::delete_secret(&state.pool, "github_token").await?;
+    let token_path = state.config.data_dir.join("github").join("token.txt");
+    let _ = tokio::fs::remove_file(&token_path).await;
+    let _ = db::cancel_pending_github_device_logins(&state.pool).await?;
     Ok(Json(json!({"ok": true})))
 }
 

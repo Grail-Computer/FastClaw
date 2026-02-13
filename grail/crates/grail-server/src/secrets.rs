@@ -36,6 +36,44 @@ pub async fn openai_api_key_configured(state: &AppState) -> anyhow::Result<bool>
     Ok(load_openai_api_key_opt(state).await?.is_some())
 }
 
+pub async fn load_github_token_opt(state: &AppState) -> anyhow::Result<Option<String>> {
+    // Common env var names used by gh CLI and CI.
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(v) = std::env::var(key) {
+            if let Some(v) = normalize_nonempty(v) {
+                return Ok(Some(v));
+            }
+        }
+    }
+
+    // Prefer encrypted secret storage when available.
+    if let Some(crypto) = state.crypto.as_deref() {
+        if let Some((nonce, ciphertext)) = db::read_secret(&state.pool, "github_token").await? {
+            let plaintext = crypto.decrypt(b"github_token", &nonce, &ciphertext)?;
+            let s = String::from_utf8(plaintext).context("GITHUB_TOKEN not valid utf-8")?;
+            if let Some(v) = normalize_nonempty(s) {
+                return Ok(Some(v));
+            }
+        }
+    }
+
+    // Fallback for device login when encrypted secret storage is disabled:
+    // store the token in `${GRAIL_DATA_DIR}/github/token.txt` with 0600 perms.
+    let token_path = state.config.data_dir.join("github").join("token.txt");
+    match tokio::fs::read(&token_path).await {
+        Ok(bytes) => {
+            let s = String::from_utf8(bytes).context("GitHub token file not valid utf-8")?;
+            Ok(normalize_nonempty(s))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read {}", token_path.display())),
+    }
+}
+
+pub async fn github_token_configured(state: &AppState) -> anyhow::Result<bool> {
+    Ok(load_github_token_opt(state).await?.is_some())
+}
+
 pub async fn load_slack_bot_token_opt(state: &AppState) -> anyhow::Result<Option<String>> {
     if let Some(v) = state.config.slack_bot_token.as_deref() {
         if let Some(v) = normalize_nonempty(v.to_string()) {
@@ -176,6 +214,15 @@ static SECRET_REDACTIONS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (
             Regex::new(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b").expect("regex"),
             "[REDACTED_TELEGRAM_TOKEN]",
+        ),
+        // GitHub tokens (classic PAT, fine-grained PAT, OAuth, server tokens).
+        (
+            Regex::new(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b").expect("regex"),
+            "[REDACTED_GITHUB_TOKEN]",
+        ),
+        (
+            Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b").expect("regex"),
+            "[REDACTED_GITHUB_TOKEN]",
         ),
         // Private keys.
         (

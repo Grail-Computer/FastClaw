@@ -8,6 +8,7 @@ mod cron_expr;
 mod crypto;
 mod db;
 mod guardrails;
+mod github_login;
 mod models;
 mod secrets;
 mod slack;
@@ -41,8 +42,8 @@ use crate::config::Config;
 use crate::crypto::{parse_master_key, Crypto};
 use crate::models::PermissionsMode;
 use crate::secrets::{
-    brave_search_api_key_configured, openai_api_key_configured, slack_bot_token_configured,
-    slack_signing_secret_configured, telegram_bot_token_configured,
+    brave_search_api_key_configured, github_token_configured, openai_api_key_configured,
+    slack_bot_token_configured, slack_signing_secret_configured, telegram_bot_token_configured,
     telegram_webhook_secret_configured,
 };
 use crate::slack::{verify_slack_signature, SlackClient};
@@ -90,6 +91,7 @@ struct AppState {
     crypto: Option<Arc<Crypto>>,
     slack_bot_user_id: Arc<RwLock<Option<String>>>,
     telegram_bot_username: Arc<RwLock<Option<String>>>,
+    task_notify: Arc<tokio::sync::Notify>,
 }
 
 #[tokio::main]
@@ -127,9 +129,10 @@ async fn main() -> anyhow::Result<()> {
             }),
         slack_bot_user_id: Arc::new(RwLock::new(None)),
         telegram_bot_username: Arc::new(RwLock::new(None)),
+        task_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
-    // Background worker (single concurrency).
+    // Background worker (configurable concurrency).
     tokio::spawn(worker::worker_loop(state.clone()));
 
     let admin = Router::new()
@@ -143,6 +146,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/device/start", post(admin_auth_device_start))
         .route("/auth/device/cancel", post(admin_auth_device_cancel))
         .route("/auth/logout", post(admin_auth_logout))
+        .route(
+            "/auth/github/device/start",
+            post(admin_auth_github_device_start),
+        )
+        .route(
+            "/auth/github/device/cancel",
+            post(admin_auth_github_device_cancel),
+        )
+        .route("/auth/github/logout", post(admin_auth_github_logout))
         .route("/secrets/openai", post(admin_set_openai_api_key))
         .route("/secrets/openai/delete", post(admin_delete_openai_api_key))
         .route("/secrets/brave", post(admin_set_brave_search_api_key))
@@ -245,6 +257,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/device/start", post(api::api_auth_device_start))
         .route("/auth/device/cancel", post(api::api_auth_device_cancel))
         .route("/auth/logout", post(api::api_auth_logout))
+        .route(
+            "/auth/github/device/start",
+            post(api::api_github_device_start),
+        )
+        .route(
+            "/auth/github/device/cancel",
+            post(api::api_github_device_cancel),
+        )
+        .route("/auth/github/logout", post(api::api_github_logout))
         .route("/diagnostics", get(api::api_diagnostics))
         .route("/diagnostics/codex", post(api::api_diagnostics_codex));
 
@@ -335,7 +356,7 @@ fn unauthorized_basic() -> Response {
     let mut resp = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     resp.headers_mut().insert(
         axum::http::header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Basic realm=\"Grail\""),
+        HeaderValue::from_static("Basic realm=\"FastClaw\""),
     );
     resp
 }
@@ -543,7 +564,10 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Html<String>> 
         .await?
         .unwrap_or_else(|| "(none)".to_string());
 
-    let active_task = db::get_runtime_active_task(&state.pool).await?;
+    let active_task = db::list_active_tasks(&state.pool, 1)
+        .await?
+        .into_iter()
+        .next();
     let pending_approvals: i64 =
         sqlx::query("SELECT COUNT(*) AS c FROM approvals WHERE status = 'pending'")
             .fetch_one(&state.pool)
@@ -1222,6 +1246,7 @@ async fn run_codex_self_test(state: &AppState) -> anyhow::Result<String> {
         workspace_id: "admin".to_string(),
         channel_id: "admin".to_string(),
         thread_ts: "".to_string(),
+        conversation_key: "admin:admin:main".to_string(),
         event_ts: format!("{now}"),
         requested_by_user_id: "admin".to_string(),
         prompt_text: "diagnostic".to_string(),
@@ -1515,12 +1540,29 @@ async fn admin_auth_get(State(state): State<AppState>) -> AppResult<Html<String>
         created_at: format!("{}", l.created_at),
     });
 
+    let github_latest = db::get_latest_github_device_login(&state.pool).await?;
+    let github_device_login = github_latest.map(|l| DeviceLoginRow {
+        status: l.status,
+        verification_url: l.verification_url,
+        user_code: l.user_code,
+        error_text: l.error_text.unwrap_or_default(),
+        created_at: format!("{}", l.created_at),
+    });
+    let github_client_id_set = std::env::var("GITHUB_CLIENT_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .is_some();
+
     let tpl = AuthTemplate {
         active: "auth",
         openai_api_key_set: openai_api_key_configured(&state).await?,
         codex_auth_file_set: auth_summary.file_present,
         codex_auth_mode: auth_summary.auth_mode,
         device_login,
+        github_client_id_set,
+        github_token_set: github_token_configured(&state).await.unwrap_or(false),
+        github_device_login,
     };
     Ok(Html(tpl.render()?))
 }
@@ -1596,6 +1638,93 @@ async fn admin_auth_logout(State(state): State<AppState>) -> AppResult<Redirect>
     Ok(Redirect::to("/admin/auth"))
 }
 
+async fn admin_auth_github_device_start(State(state): State<AppState>) -> AppResult<Redirect> {
+    // Cancel any pending login first.
+    let _ = db::cancel_pending_github_device_logins(&state.pool).await;
+
+    let client_id = std::env::var("GITHUB_CLIENT_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .context("GITHUB_CLIENT_ID is not configured")?;
+
+    let scope = std::env::var("GITHUB_OAUTH_SCOPE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build reqwest client")?;
+
+    let dc = crate::github_login::request_device_code(
+        &http,
+        crate::github_login::DEFAULT_GITHUB_BASE,
+        &client_id,
+        &scope,
+    )
+    .await?;
+
+    let verification_url = dc
+        .verification_url_complete
+        .clone()
+        .unwrap_or_else(|| dc.verification_url.clone());
+
+    let id = random_id("github_device_login");
+    let login = crate::models::GithubDeviceLogin {
+        id: id.clone(),
+        status: "pending".to_string(),
+        verification_url,
+        user_code: dc.user_code.clone(),
+        device_code: dc.device_code.clone(),
+        interval_sec: dc.interval_sec as i64,
+        error_text: None,
+        created_at: chrono::Utc::now().timestamp(),
+        completed_at: None,
+    };
+    db::insert_github_device_login(&state.pool, &login).await?;
+
+    let pool = state.pool.clone();
+    let data_dir = state.config.data_dir.clone();
+    let crypto = state.crypto.clone();
+    let base = crate::github_login::DEFAULT_GITHUB_BASE.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = run_github_device_login_flow(
+            pool,
+            id,
+            crypto,
+            data_dir,
+            base,
+            client_id,
+            dc.device_code,
+            dc.interval_sec,
+            dc.expires_in_sec,
+        )
+        .await
+        {
+            warn!(error = %err, "github device login flow failed");
+        }
+    });
+
+    Ok(Redirect::to("/admin/auth"))
+}
+
+async fn admin_auth_github_device_cancel(State(state): State<AppState>) -> AppResult<Redirect> {
+    let _ = db::cancel_pending_github_device_logins(&state.pool).await?;
+    Ok(Redirect::to("/admin/auth"))
+}
+
+async fn admin_auth_github_logout(State(state): State<AppState>) -> AppResult<Redirect> {
+    let _ = db::delete_secret(&state.pool, "github_token").await?;
+    let token_path = state.config.data_dir.join("github").join("token.txt");
+    let _ = tokio::fs::remove_file(&token_path).await;
+    let _ = db::cancel_pending_github_device_logins(&state.pool).await?;
+    Ok(Redirect::to("/admin/auth"))
+}
+
 async fn slack_events(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1652,7 +1781,7 @@ async fn slack_events(
                 is_dm,
                 is_proactive,
                 strip_mentions,
-                should_post_ack,
+                _should_post_ack,
                 allow_approval_commands,
                 files,
             ) = match event {
@@ -1752,7 +1881,7 @@ async fn slack_events(
                             {
                                 let slack = SlackClient::new(state.http.clone(), token);
                                 let msg =
-                                    "Sorry, you're not authorized to use this Grail instance.";
+                                    "Sorry, you're not authorized to use this FastClaw instance.";
                                 let _ = slack
                                     .post_message(&channel, thread_opt(&thread_ts), msg)
                                     .await;
@@ -1772,7 +1901,7 @@ async fn slack_events(
                                 {
                                     let slack = SlackClient::new(state.http.clone(), token);
                                     let msg =
-                                        "Sorry, this Grail instance isn't enabled in this channel.";
+                                        "Sorry, this FastClaw instance isn't enabled in this channel.";
                                     let _ = slack
                                         .post_message(&channel, thread_opt(&thread_ts), msg)
                                         .await;
@@ -1910,7 +2039,7 @@ async fn slack_events(
                 serde_json::to_string(&files_meta).unwrap_or_default()
             };
 
-            let task_id = match db::enqueue_task_with_files(
+            let _task_id = match db::enqueue_task_with_files(
                 &state.pool,
                 "slack",
                 &team_id,
@@ -1931,28 +2060,8 @@ async fn slack_events(
                 }
             };
 
-            // Ack immediately, post "Queued" asynchronously (but never for proactive messages).
-            if should_post_ack {
-                match crate::secrets::load_slack_bot_token_opt(&state).await {
-                    Ok(Some(token)) => {
-                        let slack = SlackClient::new(state.http.clone(), token);
-                        let queued_text = format!("Queued as #{task_id}. I'll start soon.");
-                        let thread_ts = thread_ts.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = slack
-                                .post_message(&channel, thread_opt(&thread_ts), &queued_text)
-                                .await
-                            {
-                                warn!(error = %err, "failed to post queued message");
-                            }
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(error = %err, "failed to load slack bot token");
-                    }
-                }
-            }
+            // Wake the worker immediately (avoid visible "queueing" latency).
+            state.task_notify.notify_waiters();
 
             (StatusCode::OK, "").into_response()
         }
@@ -2279,11 +2388,11 @@ async fn telegram_webhook(
     } else if let Some(user) = bot_username.as_deref() {
         text.contains(&format!("@{user}"))
             || text.starts_with("/grail")
-            || text.starts_with("/microemployee")
+            || text.starts_with("/fastclaw")
             || text.starts_with(&format!("/grail@{user}"))
-            || text.starts_with(&format!("/microemployee@{user}"))
+            || text.starts_with(&format!("/fastclaw@{user}"))
     } else {
-        text.starts_with("/grail") || text.starts_with("/microemployee")
+        text.starts_with("/grail") || text.starts_with("/fastclaw")
     };
 
     if !directed {
@@ -2295,7 +2404,7 @@ async fn telegram_webhook(
         return (StatusCode::OK, "").into_response();
     }
 
-    let task_id = match db::enqueue_task(
+    let _task_id = match db::enqueue_task(
         &state.pool,
         "telegram",
         "telegram",
@@ -2314,15 +2423,8 @@ async fn telegram_webhook(
         }
     };
 
-    let tg = crate::telegram::TelegramClient::new(state.http.clone(), token);
-    let chat_id = stored.chat_id.clone();
-    let reply_to = msg.message_id;
-    tokio::spawn(async move {
-        let queued_text = format!("Queued as #{task_id}. I'll start soon.");
-        let _ = tg
-            .send_message(&chat_id, Some(reply_to), queued_text.trim())
-            .await;
-    });
+    // Wake the worker immediately (avoid visible "queueing" latency).
+    state.task_notify.notify_waiters();
 
     (StatusCode::OK, "").into_response()
 }
@@ -2376,7 +2478,7 @@ fn clean_telegram_prompt(text: &str, bot_username: Option<&str>) -> String {
         let first = parts.next().unwrap_or("");
         let first = first.trim();
         if first.starts_with("/grail")
-            || first.starts_with("/microemployee")
+            || first.starts_with("/fastclaw")
             || first.starts_with("/start")
         {
             t = parts.collect::<Vec<_>>().join(" ").trim().to_string();
@@ -2534,6 +2636,150 @@ pub async fn run_device_login_flow(
             Err(err) => {
                 let now = chrono::Utc::now().timestamp();
                 db::update_codex_device_login_status(
+                    &pool,
+                    &login_id,
+                    "failed",
+                    Some(&format!("{err:#}")),
+                    Some(now),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+pub async fn run_github_device_login_flow(
+    pool: SqlitePool,
+    login_id: String,
+    crypto: Option<Arc<Crypto>>,
+    data_dir: std::path::PathBuf,
+    github_base: String,
+    client_id: String,
+    device_code: String,
+    interval_sec: u64,
+    expires_in_sec: u64,
+) -> anyhow::Result<()> {
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build reqwest client")?;
+
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(expires_in_sec.max(60).min(60 * 30) + 60);
+    let mut interval = interval_sec.max(1).min(30);
+
+    loop {
+        // Check cancellation.
+        let status = db::get_github_device_login(&pool, &login_id)
+            .await?
+            .map(|l| l.status)
+            .unwrap_or_else(|| "missing".to_string());
+        if status != "pending" {
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let now = chrono::Utc::now().timestamp();
+            db::update_github_device_login_status(
+                &pool,
+                &login_id,
+                "failed",
+                Some("github device login timed out"),
+                Some(now),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        match crate::github_login::poll_for_token(&http, &github_base, &client_id, &device_code)
+            .await
+        {
+            Ok(crate::github_login::TokenPoll::Pending) => {
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+            Ok(crate::github_login::TokenPoll::SlowDown) => {
+                interval = (interval + 5).min(30);
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+            Ok(crate::github_login::TokenPoll::Success { access_token }) => {
+                // Clean up any old token artifacts first.
+                let _ = db::delete_secret(&pool, "github_token").await;
+                let token_path = data_dir.join("github").join("token.txt");
+                let _ = tokio::fs::remove_file(&token_path).await;
+
+                if let Some(crypto) = crypto.as_deref() {
+                    let (nonce, ciphertext) =
+                        crypto.encrypt(b"github_token", access_token.as_bytes())?;
+                    db::upsert_secret(&pool, "github_token", &nonce, &ciphertext).await?;
+                } else {
+                    use std::fs::OpenOptions;
+                    use std::io::Write;
+                    #[cfg(unix)]
+                    use std::os::unix::fs::OpenOptionsExt;
+
+                    if let Some(parent) = token_path.parent() {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .with_context(|| format!("create {}", parent.display()))?;
+                    }
+
+                    let token = access_token.clone();
+                    let token_path2 = token_path.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        let mut options = OpenOptions::new();
+                        options.truncate(true).write(true).create(true);
+                        #[cfg(unix)]
+                        {
+                            options.mode(0o600);
+                        }
+                        let mut f = options
+                            .open(&token_path2)
+                            .with_context(|| format!("open {}", token_path2.display()))?;
+                        f.write_all(token.as_bytes())
+                            .with_context(|| format!("write {}", token_path2.display()))?;
+                        f.write_all(b"\n")
+                            .with_context(|| format!("write {}", token_path2.display()))?;
+                        f.flush()
+                            .with_context(|| format!("flush {}", token_path2.display()))?;
+                        Ok(())
+                    })
+                    .await
+                    .context("spawn_blocking write github token")??;
+                }
+
+                let now = chrono::Utc::now().timestamp();
+                db::update_github_device_login_status(
+                    &pool,
+                    &login_id,
+                    "completed",
+                    None,
+                    Some(now),
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(crate::github_login::TokenPoll::Failed { error, description }) => {
+                let now = chrono::Utc::now().timestamp();
+                let msg = if description.trim().is_empty() {
+                    error
+                } else {
+                    format!("{error}: {description}")
+                };
+                db::update_github_device_login_status(
+                    &pool,
+                    &login_id,
+                    "failed",
+                    Some(&msg),
+                    Some(now),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(err) => {
+                let now = chrono::Utc::now().timestamp();
+                db::update_github_device_login_status(
                     &pool,
                     &login_id,
                     "failed",

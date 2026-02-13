@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -5,28 +8,38 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use cron::Schedule;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::Digest;
 use tracing::{info, warn};
 
 use crate::codex::CodexManager;
 use crate::db;
-use crate::models::Session;
+use crate::models::{ObservationalMemory, Session};
 use crate::slack::SlackClient;
 use crate::telegram::TelegramClient;
 use crate::AppState;
 
 pub async fn worker_loop(state: AppState) {
-    const LEASE_SECONDS: i64 = 60;
-    const RENEW_EVERY_SECONDS: u64 = 20;
+    const WORKER_LOCK_LEASE_SECONDS: i64 = 60;
+    const WORKER_LOCK_RENEW_EVERY_SECONDS: u64 = 20;
+    const CONVERSATION_LOCK_LEASE_SECONDS: i64 = 60 * 15;
+    const CONVERSATION_LOCK_RENEW_EVERY_SECONDS: u64 = 30;
 
     let worker_id = random_id("worker");
-    let mut codex = CodexManager::new(state.config.clone());
+    let concurrency = std::cmp::max(1, state.config.worker_concurrency);
 
     loop {
         // Acquire the worker lock so only one instance processes tasks at a time.
         loop {
-            match db::try_acquire_or_renew_worker_lock(&state.pool, &worker_id, LEASE_SECONDS).await
+            match db::try_acquire_or_renew_worker_lock(
+                &state.pool,
+                &worker_id,
+                WORKER_LOCK_LEASE_SECONDS,
+            )
+            .await
             {
                 Ok(true) => {
                     info!(%worker_id, "acquired worker lock");
@@ -42,6 +55,7 @@ pub async fn worker_loop(state: AppState) {
             }
         }
 
+        // Reset tasks left in-flight after restart.
         match db::reset_running_tasks(&state.pool).await {
             Ok(n) if n > 0 => {
                 warn!(
@@ -54,6 +68,10 @@ pub async fn worker_loop(state: AppState) {
                 warn!(error = %err, "failed to reset running tasks after acquiring lock");
             }
         }
+
+        // Clear any stale per-conversation locks / runtime state.
+        let _ = db::clear_all_conversation_locks(&state.pool).await;
+        let _ = db::clear_runtime_active_tasks(&state.pool).await;
 
         // Periodic DB hygiene (only the lock-holder runs this).
         match db::cleanup_old_tasks(&state.pool, 30).await {
@@ -73,8 +91,13 @@ pub async fn worker_loop(state: AppState) {
         let worker_id2 = worker_id.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(RENEW_EVERY_SECONDS)).await;
-                match db::try_acquire_or_renew_worker_lock(&pool, &worker_id2, LEASE_SECONDS).await
+                tokio::time::sleep(Duration::from_secs(WORKER_LOCK_RENEW_EVERY_SECONDS)).await;
+                match db::try_acquire_or_renew_worker_lock(
+                    &pool,
+                    &worker_id2,
+                    WORKER_LOCK_LEASE_SECONDS,
+                )
+                .await
                 {
                     Ok(true) => {}
                     Ok(false) => {
@@ -89,8 +112,28 @@ pub async fn worker_loop(state: AppState) {
             }
         });
 
+        // Spawn task workers. Each worker keeps its own Codex subprocess.
+        let mut workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for slot in 0..concurrency {
+            let st = state.clone();
+            let wid = worker_id.clone();
+            let has = has_lock.clone();
+            workers.push(tokio::spawn(async move {
+                task_worker_loop(
+                    st,
+                    wid,
+                    slot,
+                    has,
+                    CONVERSATION_LOCK_LEASE_SECONDS,
+                    CONVERSATION_LOCK_RENEW_EVERY_SECONDS,
+                )
+                .await;
+            }));
+        }
+
         let mut last_cleanup = Instant::now();
         let mut last_cron_check = Instant::now();
+        let mut last_conv_lock_cleanup = Instant::now();
         while has_lock.load(Ordering::SeqCst) {
             if last_cleanup.elapsed() >= Duration::from_secs(60 * 60) {
                 match db::cleanup_old_tasks(&state.pool, 30).await {
@@ -106,6 +149,12 @@ pub async fn worker_loop(state: AppState) {
                 last_cleanup = Instant::now();
             }
 
+            // Clear expired conversation locks so backlog doesn't get stuck after crashes.
+            if last_conv_lock_cleanup.elapsed() >= Duration::from_secs(30) {
+                last_conv_lock_cleanup = Instant::now();
+                let _ = db::cleanup_expired_conversation_locks(&state.pool).await;
+            }
+
             // Enqueue due cron jobs. This is done by the lock-holder so replicas don't duplicate work.
             if last_cron_check.elapsed() >= Duration::from_secs(2) {
                 last_cron_check = Instant::now();
@@ -118,55 +167,105 @@ pub async fn worker_loop(state: AppState) {
                 }
             }
 
-            match db::claim_next_task(&state.pool).await {
-                Ok(Some(task)) => {
-                    let task_id = task.id;
-                    if let Err(err) = db::set_runtime_active_task(&state.pool, Some(task_id)).await
-                    {
-                        warn!(error = %err, "failed to set runtime active task");
-                    }
-                    let result = process_task(&state, &mut codex, &task).await;
-                    match result {
-                        Ok(text) => {
-                            if let Err(err) =
-                                db::complete_task_success(&state.pool, task_id, &text).await
-                            {
-                                warn!(error = %err, task_id, "failed to mark task succeeded");
-                            }
-                        }
-                        Err(err) => {
-                            let msg = format!("{err:#}");
-                            warn!(error = %msg, task_id, "task failed");
-                            let _ = db::complete_task_failure(&state.pool, task_id, &msg).await;
-
-                            // Proactive tasks should never spam the channel on failure.
-                            if !task.is_proactive {
-                                let user_msg = format!(
-                                    "Task #{task_id} failed. Check /admin/tasks for details.\n\nError: {short}",
-                                    short = shorten_error(&msg)
-                                );
-                                let _ = send_user_message(&state, &task, &user_msg).await;
-                            }
-                        }
-                    }
-                    if let Err(err) = db::set_runtime_active_task(&state.pool, None).await {
-                        warn!(error = %err, "failed to clear runtime active task");
-                    }
-                }
-                Ok(None) => {
-                    tokio::time::sleep(Duration::from_millis(750)).await;
-                }
-                Err(err) => {
-                    warn!(error = %err, "worker loop db error");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        // Lock was lost; stop Codex to avoid two workers running at once.
-        codex.stop().await;
+        // Lock was lost; abort workers so no more tasks run in this instance.
+        for h in workers {
+            h.abort();
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+async fn task_worker_loop(
+    state: AppState,
+    worker_id: String,
+    slot: usize,
+    has_lock: Arc<AtomicBool>,
+    conversation_lease_seconds: i64,
+    conversation_renew_every_seconds: u64,
+) {
+    let mut codex = CodexManager::new(state.config.clone());
+
+    while has_lock.load(Ordering::SeqCst) {
+        match db::claim_next_task(&state.pool, &worker_id, conversation_lease_seconds).await {
+            Ok(Some(task)) => {
+                let task_id = task.id;
+                let conversation_key = task.conversation_key.clone();
+
+                if let Err(err) = db::mark_task_active(&state.pool, task_id).await {
+                    warn!(error = %err, task_id, "failed to mark task active");
+                }
+
+                // Renew the per-conversation lock while processing to avoid expiry mid-turn.
+                let keep_renewing = Arc::new(AtomicBool::new(true));
+                let keep_renewing2 = keep_renewing.clone();
+                let pool = state.pool.clone();
+                let worker_id2 = worker_id.clone();
+                let conversation_key2 = conversation_key.clone();
+                let has_lock2 = has_lock.clone();
+                let renew_handle = tokio::spawn(async move {
+                    while has_lock2.load(Ordering::SeqCst) && keep_renewing2.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_secs(conversation_renew_every_seconds))
+                            .await;
+                        let _ = db::try_renew_conversation_lock(
+                            &pool,
+                            &conversation_key2,
+                            &worker_id2,
+                            conversation_lease_seconds,
+                        )
+                        .await;
+                    }
+                });
+
+                let result = process_task(&state, &mut codex, &task).await;
+                match result {
+                    Ok(text) => {
+                        if let Err(err) =
+                            db::complete_task_success(&state.pool, task_id, &text).await
+                        {
+                            warn!(error = %err, task_id, "failed to mark task succeeded");
+                        }
+                    }
+                    Err(err) => {
+                        let msg = format!("{err:#}");
+                        warn!(error = %msg, task_id, worker_slot = slot, "task failed");
+                        let _ = db::complete_task_failure(&state.pool, task_id, &msg).await;
+
+                        // Proactive tasks should never spam the channel on failure.
+                        if !task.is_proactive {
+                            let user_msg = format!(
+                                "Task #{task_id} failed. Check /admin/tasks for details.\n\nError: {short}",
+                                short = shorten_error(&msg)
+                            );
+                            let _ = send_user_message(&state, &task, &user_msg).await;
+                        }
+                    }
+                }
+
+                keep_renewing.store(false, Ordering::SeqCst);
+                renew_handle.abort();
+
+                let _ =
+                    db::release_conversation_lock(&state.pool, &conversation_key, &worker_id).await;
+                let _ = db::mark_task_inactive(&state.pool, task_id).await;
+            }
+            Ok(None) => {
+                tokio::select! {
+                    _ = state.task_notify.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(750)) => {},
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, worker_slot = slot, "task worker db error");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    codex.stop().await;
 }
 
 async fn enqueue_due_cron_jobs(state: &AppState) -> anyhow::Result<()> {
@@ -329,6 +428,7 @@ async fn enqueue_due_cron_jobs(state: &AppState) -> anyhow::Result<()> {
             &prompt,
         )
         .await?;
+        state.task_notify.notify_waiters();
 
         // Compute next run.
         match compute_next_run_at(&job, now) {
@@ -419,6 +519,248 @@ fn random_id(prefix: &str) -> String {
     let mut rng = rand::rng();
     rand::RngCore::fill_bytes(&mut rng, &mut bytes);
     format!("{}_{}", prefix, hex::encode(bytes))
+}
+
+#[derive(Debug, Clone)]
+struct RepoPrepItem {
+    clone_url: String,
+    dest_rel: String,
+    status: String, // cloned | present | failed
+    error: Option<String>,
+}
+
+static RE_GITHUB_HTTP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
+        .expect("regex")
+});
+static RE_GITHUB_SSH: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)").expect("regex")
+});
+
+static REPO_CLONE_LOCKS: Lazy<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn extract_github_repo_pairs(text: &str) -> Vec<(String, String)> {
+    const MAX_REPOS_PER_TASK: usize = 5;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    for re in [&*RE_GITHUB_HTTP, &*RE_GITHUB_SSH] {
+        for cap in re.captures_iter(text) {
+            let owner = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+            let mut repo = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim().to_string();
+            if owner.is_empty() || repo.is_empty() {
+                continue;
+            }
+            // Strip trailing ".git" if present.
+            if let Some(stripped) = repo.strip_suffix(".git") {
+                repo = stripped.to_string();
+            }
+            let pair = (owner.to_string(), repo);
+            if seen.insert(pair.clone()) {
+                out.push(pair);
+            }
+            if out.len() >= MAX_REPOS_PER_TASK {
+                return out;
+            }
+        }
+    }
+
+    out
+}
+
+async fn repo_lock_for_key(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = REPO_CLONE_LOCKS.lock().await;
+    locks
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+async fn maybe_prepare_github_repos(
+    state: &AppState,
+    conversation_key: &str,
+    cwd: &Path,
+    prompt_text: &str,
+) -> anyhow::Result<(Vec<RepoPrepItem>, String)> {
+    let pairs = extract_github_repo_pairs(prompt_text);
+    if pairs.is_empty() {
+        return Ok((Vec::new(), String::new()));
+    }
+
+    let conv_hash = sha256_hex(conversation_key.as_bytes());
+    let repos_root = cwd.join("repos").join(&conv_hash);
+    tokio::fs::create_dir_all(&repos_root)
+        .await
+        .with_context(|| format!("create {}", repos_root.display()))?;
+
+    let token = crate::secrets::load_github_token_opt(state).await?;
+
+    let mut items: Vec<RepoPrepItem> = Vec::new();
+    for (owner, repo) in pairs {
+        let clone_url = format!("https://github.com/{owner}/{repo}.git");
+        let dest_rel = format!("repos/{conv_hash}/{owner}__{repo}");
+        let dest_abs = cwd.join(&dest_rel);
+
+        let lock_key = dest_abs.to_string_lossy().to_string();
+        let lock = repo_lock_for_key(&lock_key).await;
+        let _guard = lock.lock().await;
+
+        // If the directory already looks like a git repo, keep it.
+        if dest_abs.join(".git").exists() {
+            items.push(RepoPrepItem {
+                clone_url,
+                dest_rel,
+                status: "present".to_string(),
+                error: None,
+            });
+            continue;
+        }
+
+        // Clean up partial clones.
+        if dest_abs.exists() {
+            let _ = tokio::fs::remove_dir_all(&dest_abs).await;
+        }
+
+        let dest_parent = dest_abs.parent().unwrap_or(cwd);
+        let _ = tokio::fs::create_dir_all(dest_parent).await;
+
+        match git_clone_with_optional_token(token.as_deref(), &clone_url, &dest_abs).await {
+            Ok(()) => items.push(RepoPrepItem {
+                clone_url,
+                dest_rel,
+                status: "cloned".to_string(),
+                error: None,
+            }),
+            Err(err) => {
+                let msg = shorten_error(&format!("{err:#}"));
+                items.push(RepoPrepItem {
+                    clone_url,
+                    dest_rel,
+                    status: "failed".to_string(),
+                    error: Some(msg),
+                });
+            }
+        }
+    }
+
+    let mut repo_text = String::new();
+    repo_text.push_str("Repositories (auto-cloned from your message when possible):\n");
+    for it in &items {
+        if it.status == "failed" {
+            repo_text.push_str(&format!(
+                "- {} -> {} ({})\n  error: {}\n",
+                it.clone_url,
+                it.dest_rel,
+                it.status,
+                it.error.as_deref().unwrap_or("unknown error")
+            ));
+        } else {
+            repo_text.push_str(&format!(
+                "- {} -> {} ({})\n",
+                it.clone_url, it.dest_rel, it.status
+            ));
+        }
+    }
+    repo_text.push('\n');
+    repo_text.push_str("Repo notes:\n");
+    repo_text.push_str("- These repos live under the context directory, so you can reference files using the paths above.\n");
+    repo_text.push_str("- When you want to modify repo files, return edits via `context_writes` using paths under the repo directory.\n");
+    if token.is_none() {
+        repo_text.push_str("- No GitHub token is configured; private repo clones will fail. Configure one in /admin/auth (GitHub) or set GITHUB_TOKEN.\n");
+    }
+    repo_text.push('\n');
+
+    Ok((items, repo_text))
+}
+
+async fn git_clone_with_optional_token(
+    token: Option<&str>,
+    clone_url: &str,
+    dest_dir: &Path,
+) -> anyhow::Result<()> {
+    // Ensure git is available.
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--no-tags")
+        .arg("--single-branch")
+        .arg("--")
+        .arg(clone_url)
+        .arg(dest_dir);
+
+    cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+    let askpass_path: Option<PathBuf> = if let Some(tok) = token {
+        let p = write_git_askpass_script().await?;
+        cmd.env("GIT_ASKPASS", &p);
+        cmd.env("GRAIL_GITHUB_TOKEN", tok);
+        Some(p)
+    } else {
+        None
+    };
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let out = cmd.output().await.context("git clone")?;
+    if let Some(p) = askpass_path {
+        let _ = tokio::fs::remove_file(p).await;
+    }
+    if out.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let (stderr, _) = crate::secrets::redact_secrets(stderr.trim());
+    anyhow::bail!("git clone failed: {}", shorten_error(&stderr))
+}
+
+async fn write_git_askpass_script() -> anyhow::Result<PathBuf> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = std::env::temp_dir().join(format!("grail-git-askpass-{}.sh", random_id("x")));
+    let script = r#"#!/bin/sh
+set -eu
+prompt="$1"
+case "$prompt" in
+  *sername*) printf '%s\n' "x-access-token" ;;
+  *assword*) printf '%s\n' "${GRAIL_GITHUB_TOKEN:-}" ;;
+  *) printf '\n' ;;
+esac
+"#;
+
+    let path2 = path.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut options = OpenOptions::new();
+        options.truncate(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o700);
+        }
+        let mut f = options
+            .open(&path2)
+            .with_context(|| format!("open {}", path2.display()))?;
+        f.write_all(script.as_bytes())
+            .with_context(|| format!("write {}", path2.display()))?;
+        f.flush()
+            .with_context(|| format!("flush {}", path2.display()))?;
+        Ok(())
+    })
+    .await
+    .context("spawn_blocking write askpass")??;
+
+    Ok(path)
 }
 
 async fn process_task(
@@ -536,7 +878,11 @@ async fn process_task(
         )
         .await?;
 
-    let conversation_key = conversation_key_for_task(task);
+    let conversation_key = if !task.conversation_key.trim().is_empty() {
+        task.conversation_key.clone()
+    } else {
+        conversation_key_for_task(task)
+    };
     let mut session = db::get_session(&state.pool, &conversation_key)
         .await?
         .unwrap_or(Session {
@@ -548,16 +894,53 @@ async fn process_task(
 
     let cwd = state.config.data_dir.join("context");
     let cwd = tokio::fs::canonicalize(&cwd).await.unwrap_or(cwd);
+
+    let repo_context_text = match maybe_prepare_github_repos(state, &conversation_key, &cwd, task.prompt_text.trim()).await {
+        Ok((_items, txt)) => txt,
+        Err(err) => {
+            warn!(error = %err, task_id = task.id, "failed to prepare github repos");
+            format!(
+                "Repositories:\n- (repo preparation failed: {})\n\n",
+                shorten_error(&format!("{err:#}"))
+            )
+        }
+    };
+
     let thread_id = codex
         .resume_or_start_thread(session.codex_thread_id.as_deref(), &settings, &cwd)
         .await?;
     session.codex_thread_id = Some(thread_id.clone());
 
+    let thread_mem_key = observational_thread_memory_key(&conversation_key);
+    let resource_mem_key = observational_resource_memory_key(task);
+    let thread_mem = match db::get_observational_memory(&state.pool, &thread_mem_key).await {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, key = %thread_mem_key, "failed to load thread observational memory");
+            None
+        }
+    };
+    let resource_mem = if let Some(k) = resource_mem_key.as_deref() {
+        match db::get_observational_memory(&state.pool, k).await {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, key = %k, "failed to load resource observational memory");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let observational_memory_text =
+        format_observational_memory_for_prompt(thread_mem.as_ref(), resource_mem.as_ref());
+
     let input = build_turn_input(
         task,
         &settings,
+        &observational_memory_text,
         &session.memory_summary,
         &context_text,
+        &repo_context_text,
         allow_slack_mcp,
         allow_web_mcp,
     );
@@ -650,6 +1033,11 @@ async fn process_task(
                         && settings.allow_context_writes
                     {
                         for cw in &parsed.context_writes {
+                            // Source code repos can be large/noisy; don't auto-upload repo files.
+                            // The agent can still explicitly request uploads via `upload_files`.
+                            if is_under_repos_dir(&cw.path) {
+                                continue;
+                            }
                             let path = cwd.join(&cw.path);
                             upload_paths.insert(path);
                         }
@@ -761,7 +1149,348 @@ async fn process_task(
         info!(task_id = task.id, provider = %provider, "skipped reply");
     }
 
+    // Best-effort: update observational memory after a successful reply.
+    if should_post_message {
+        if let Err(err) = update_observational_memory_for_turn(
+            state,
+            codex,
+            task,
+            &settings,
+            &cwd,
+            &context_text,
+            &reply_text,
+            &thread_mem_key,
+            resource_mem_key.as_deref(),
+        )
+        .await
+        {
+            warn!(error = %err, task_id = task.id, "failed to update observational memory");
+        }
+    }
+
     Ok(reply_text)
+}
+
+async fn update_observational_memory_for_turn(
+    state: &AppState,
+    codex: &mut CodexManager,
+    task: &crate::models::Task,
+    settings: &crate::models::Settings,
+    cwd: &std::path::Path,
+    recent_context: &str,
+    reply_text: &str,
+    thread_memory_key: &str,
+    resource_memory_key: Option<&str>,
+) -> anyhow::Result<()> {
+    // Run memory updates in a read-only sandbox even if the main agent is allowed to write.
+    let mut mem_settings = settings.clone();
+    mem_settings.permissions_mode = crate::models::PermissionsMode::Read;
+    mem_settings.allow_context_writes = false;
+    mem_settings.shell_network_access = false;
+
+    observe_and_maybe_reflect(
+        state,
+        codex,
+        task,
+        &mem_settings,
+        cwd,
+        "thread",
+        thread_memory_key,
+        recent_context,
+        reply_text,
+    )
+    .await?;
+
+    if let Some(k) = resource_memory_key {
+        observe_and_maybe_reflect(
+            state,
+            codex,
+            task,
+            &mem_settings,
+            cwd,
+            "resource",
+            k,
+            recent_context,
+            reply_text,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn observe_and_maybe_reflect(
+    state: &AppState,
+    codex: &mut CodexManager,
+    task: &crate::models::Task,
+    settings: &crate::models::Settings,
+    cwd: &std::path::Path,
+    scope: &str,
+    memory_key: &str,
+    recent_context: &str,
+    reply_text: &str,
+) -> anyhow::Result<()> {
+    const REFLECT_AT_CHARS: usize = 30_000;
+    const MAX_OBS_LOG_CHARS: usize = 12_000;
+    const MAX_REFLECTION_CHARS: usize = 6_000;
+
+    let existing = db::get_observational_memory(&state.pool, memory_key)
+        .await?
+        .unwrap_or(ObservationalMemory {
+            memory_key: memory_key.to_string(),
+            scope: scope.to_string(),
+            observation_log: String::new(),
+            reflection_summary: String::new(),
+            updated_at: 0,
+        });
+
+    // --- Observer ---
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let observer_input = build_observer_input(
+        scope,
+        memory_key,
+        &existing,
+        task,
+        recent_context,
+        reply_text,
+    );
+    let observer_schema = observer_output_schema();
+    let observer_thread_id = codex.resume_or_start_thread(None, settings, cwd).await?;
+    let out = codex
+        .run_turn(
+            state,
+            task,
+            &observer_thread_id,
+            settings,
+            cwd,
+            &observer_input,
+            observer_schema,
+        )
+        .await?;
+    let obs = parse_observer_json(&out.agent_message_text)?;
+    let mut append = obs.append.trim().to_string();
+    if append.is_empty() {
+        return Ok(());
+    }
+
+    let (next, redacted) = crate::secrets::redact_secrets(&append);
+    if redacted {
+        warn!(memory_key, "redacted secrets from observer append");
+    }
+    append = next;
+
+    let wrapped = format!("\nDate: {date}\n{append}\n");
+    db::append_observational_memory(&state.pool, memory_key, scope, &wrapped).await?;
+
+    // --- Reflector (optional) ---
+    let Some(updated) = db::get_observational_memory(&state.pool, memory_key).await? else {
+        return Ok(());
+    };
+    if updated.observation_log.len() < REFLECT_AT_CHARS {
+        return Ok(());
+    }
+
+    let reflector_input = build_reflector_input(scope, memory_key, &updated);
+    let reflector_schema = reflector_output_schema();
+    let reflector_thread_id = codex.resume_or_start_thread(None, settings, cwd).await?;
+    let out = codex
+        .run_turn(
+            state,
+            task,
+            &reflector_thread_id,
+            settings,
+            cwd,
+            &reflector_input,
+            reflector_schema,
+        )
+        .await?;
+    let mut refl = parse_reflector_json(&out.agent_message_text)?;
+
+    let (rs, redacted) = crate::secrets::redact_secrets(&refl.reflection_summary);
+    if redacted {
+        warn!(memory_key, "redacted secrets from reflection_summary");
+    }
+    refl.reflection_summary = clamp_len(rs, MAX_REFLECTION_CHARS);
+
+    let (ol, redacted) = crate::secrets::redact_secrets(&refl.observation_log);
+    if redacted {
+        warn!(memory_key, "redacted secrets from observation_log");
+    }
+    refl.observation_log = take_last_chars(ol.trim(), MAX_OBS_LOG_CHARS);
+
+    db::set_observational_memory(
+        &state.pool,
+        memory_key,
+        scope,
+        &refl.observation_log,
+        &refl.reflection_summary,
+    )
+    .await?;
+
+    Ok(())
+}
+
+fn build_observer_input(
+    scope: &str,
+    memory_key: &str,
+    existing: &ObservationalMemory,
+    task: &crate::models::Task,
+    recent_context: &str,
+    reply_text: &str,
+) -> String {
+    // Keep the prompt stable and constrained. The observer should produce only new, durable notes.
+    let mut s = String::new();
+    s.push_str("You are the Observational Memory Observer.\n");
+    s.push_str(
+        "Your job is to extract durable, useful observations from a single completed chat turn.\n",
+    );
+    s.push_str("Do NOT include secrets (tokens, API keys, passwords).\n");
+    s.push_str("Do NOT restate the whole conversation. Prefer short bullets.\n");
+    s.push_str("If there is nothing worth remembering long-term, return an empty string.\n\n");
+
+    s.push_str("Memory target:\n");
+    s.push_str(&format!("- scope: {scope}\n"));
+    s.push_str(&format!("- memory_key: {memory_key}\n\n"));
+
+    if !existing.reflection_summary.trim().is_empty() {
+        s.push_str("Existing reflection summary:\n");
+        s.push_str(existing.reflection_summary.trim());
+        s.push_str("\n\n");
+    }
+    if !existing.observation_log.trim().is_empty() {
+        s.push_str("Existing observation log (tail):\n");
+        s.push_str(tail_chars(existing.observation_log.trim(), 4_000).trim());
+        s.push_str("\n\n");
+    }
+
+    s.push_str("Turn metadata:\n");
+    s.push_str(&format!("- provider: {}\n", task.provider));
+    s.push_str(&format!("- workspace_id: {}\n", task.workspace_id));
+    s.push_str(&format!("- channel_id: {}\n", task.channel_id));
+    s.push_str(&format!("- thread_ts: {}\n", task.thread_ts));
+    s.push_str(&format!(
+        "- requested_by_user_id: {}\n",
+        task.requested_by_user_id
+    ));
+    s.push_str(&format!("- event_ts: {}\n\n", task.event_ts));
+
+    let (recent_context, rc_redacted) = crate::secrets::redact_secrets(recent_context.trim());
+    let (prompt_text, p_redacted) = crate::secrets::redact_secrets(task.prompt_text.trim());
+    let (reply_text, r_redacted) = crate::secrets::redact_secrets(reply_text.trim());
+    if rc_redacted || p_redacted || r_redacted {
+        warn!(memory_key, "redacted secrets from observer input");
+    }
+
+    s.push_str("Recent chat context (oldest -> newest):\n");
+    s.push_str(recent_context.trim());
+    s.push_str("\n\n");
+
+    s.push_str("User request:\n");
+    s.push_str(prompt_text.trim());
+    s.push_str("\n\n");
+
+    s.push_str("Agent reply:\n");
+    s.push_str(reply_text.trim());
+    s.push_str("\n\n");
+
+    s.push_str("Return ONLY valid JSON:\n");
+    s.push_str("{\"append\":\"<bullets>\"}\n");
+    s.push_str("Rules for append:\n");
+    s.push_str("- Either empty string, OR a markdown bullet list starting with '- '.\n");
+    s.push_str("- Each bullet is a durable fact, preference, decision, or task outcome.\n");
+    s
+}
+
+fn build_reflector_input(scope: &str, memory_key: &str, mem: &ObservationalMemory) -> String {
+    let mut s = String::new();
+    s.push_str("You are the Observational Memory Reflector.\n");
+    s.push_str("Your job is to condense an observation log into a stable reflection summary and a shorter observation log.\n");
+    s.push_str("Do NOT include secrets (tokens, API keys, passwords).\n\n");
+
+    s.push_str("Memory target:\n");
+    s.push_str(&format!("- scope: {scope}\n"));
+    s.push_str(&format!("- memory_key: {memory_key}\n\n"));
+
+    if !mem.reflection_summary.trim().is_empty() {
+        s.push_str("Existing reflection summary:\n");
+        s.push_str(mem.reflection_summary.trim());
+        s.push_str("\n\n");
+    }
+
+    s.push_str("Observation log:\n");
+    // We intentionally cap what we send here to keep costs predictable.
+    s.push_str(tail_chars(mem.observation_log.trim(), 20_000).trim());
+    s.push_str("\n\n");
+
+    s.push_str("Return ONLY valid JSON:\n");
+    s.push_str("{\"reflection_summary\":\"<summary>\",\"observation_log\":\"<trimmed_log>\"}\n");
+    s.push_str("Rules:\n");
+    s.push_str("- reflection_summary: concise markdown bullets of durable patterns/goals/preferences/important facts.\n");
+    s.push_str("- observation_log: keep only the most recent raw observations (tail), as markdown, shorter than the input.\n");
+    s
+}
+
+fn observer_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "append": { "type": "string" }
+        },
+        "required": ["append"],
+        "additionalProperties": false
+    })
+}
+
+fn reflector_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "reflection_summary": { "type": "string" },
+            "observation_log": { "type": "string" }
+        },
+        "required": ["reflection_summary", "observation_log"],
+        "additionalProperties": false
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ObserverJson {
+    append: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReflectorJson {
+    reflection_summary: String,
+    observation_log: String,
+}
+
+fn parse_observer_json(text: &str) -> anyhow::Result<ObserverJson> {
+    parse_json_object(text).context("parse observer json")
+}
+
+fn parse_reflector_json(text: &str) -> anyhow::Result<ReflectorJson> {
+    parse_json_object(text).context("parse reflector json")
+}
+
+fn parse_json_object<T: for<'de> Deserialize<'de>>(text: &str) -> anyhow::Result<T> {
+    let t = strip_code_fences(text).trim();
+    if t.is_empty() {
+        anyhow::bail!("empty json");
+    }
+    if let Ok(v) = serde_json::from_str::<T>(t) {
+        return Ok(v);
+    }
+    let Some(start) = t.find('{') else {
+        anyhow::bail!("no json object start");
+    };
+    let Some(end) = t.rfind('}') else {
+        anyhow::bail!("no json object end");
+    };
+    if end <= start {
+        anyhow::bail!("invalid json span");
+    }
+    let slice = &t[start..=end];
+    serde_json::from_str::<T>(slice).context("deserialize json object")
 }
 
 fn conversation_key_for_task(task: &crate::models::Task) -> String {
@@ -782,6 +1511,93 @@ fn conversation_key_for_task(task: &crate::models::Task) -> String {
     } else {
         format!("{}:{}:main", task.workspace_id, task.channel_id)
     }
+}
+
+fn observational_thread_memory_key(conversation_key: &str) -> String {
+    format!("thread:{conversation_key}")
+}
+
+fn observational_resource_memory_key(task: &crate::models::Task) -> Option<String> {
+    let provider = task.provider.trim().to_ascii_lowercase();
+    let user = task.requested_by_user_id.trim();
+    if provider.is_empty() || user.is_empty() || user == "unknown" {
+        return None;
+    }
+    Some(format!("resource:{provider}:{}:{user}", task.workspace_id))
+}
+
+fn take_last_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    s.chars()
+        .rev()
+        .take(max)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+fn tail_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    format!("...{}", take_last_chars(s, max))
+}
+
+fn format_observational_memory_for_prompt(
+    thread_mem: Option<&ObservationalMemory>,
+    resource_mem: Option<&ObservationalMemory>,
+) -> String {
+    const MAX_REFLECTION_CHARS: usize = 4_000;
+    const MAX_OBSERVATION_TAIL_CHARS: usize = 12_000;
+
+    let mut out = String::new();
+
+    if let Some(m) = resource_mem {
+        out.push_str("Resource scope (user):\n");
+        if !m.reflection_summary.trim().is_empty() {
+            out.push_str("Reflection:\n");
+            out.push_str(
+                clamp_len(
+                    m.reflection_summary.trim().to_string(),
+                    MAX_REFLECTION_CHARS,
+                )
+                .trim(),
+            );
+            out.push('\n');
+        }
+        if !m.observation_log.trim().is_empty() {
+            out.push_str("Observations (most recent tail):\n");
+            out.push_str(tail_chars(m.observation_log.trim(), MAX_OBSERVATION_TAIL_CHARS).trim());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    if let Some(m) = thread_mem {
+        out.push_str("Thread scope (conversation):\n");
+        if !m.reflection_summary.trim().is_empty() {
+            out.push_str("Reflection:\n");
+            out.push_str(
+                clamp_len(
+                    m.reflection_summary.trim().to_string(),
+                    MAX_REFLECTION_CHARS,
+                )
+                .trim(),
+            );
+            out.push('\n');
+        }
+        if !m.observation_log.trim().is_empty() {
+            out.push_str("Observations (most recent tail):\n");
+            out.push_str(tail_chars(m.observation_log.trim(), MAX_OBSERVATION_TAIL_CHARS).trim());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    out.trim().to_string()
 }
 
 fn thread_opt(thread_ts: &str) -> Option<&str> {
@@ -978,8 +1794,10 @@ fn format_telegram_context(messages: &[crate::models::TelegramMessage]) -> Strin
 fn build_turn_input(
     task: &crate::models::Task,
     settings: &crate::models::Settings,
+    observational_memory: &str,
     memory_summary: &str,
     recent_context: &str,
+    repo_context: &str,
     allow_slack_mcp: bool,
     allow_web_mcp: bool,
 ) -> String {
@@ -1023,6 +1841,14 @@ fn build_turn_input(
             s.push_str(settings.slack_proactive_snippet.trim());
             s.push_str("\n\n");
         }
+    }
+
+    s.push_str("Observational memory (auto-extracted, long-term, no secrets):\n");
+    if observational_memory.trim().is_empty() {
+        s.push_str("(none)\n\n");
+    } else {
+        s.push_str(observational_memory.trim());
+        s.push_str("\n\n");
     }
 
     s.push_str("Session memory summary (rolling, durable, no secrets):\n");
@@ -1094,6 +1920,13 @@ fn build_turn_input(
         }
     }
 
+    if repo_context.trim().is_empty() {
+        s.push_str("Repositories:\n(none)\n\n");
+    } else {
+        s.push_str(repo_context.trim());
+        s.push_str("\n\n");
+    }
+
     s.push_str("Durable knowledge:\n");
     s.push_str("- If you want to write durable notes/docs, return them via `context_writes` with a RELATIVE path under the context directory.\n");
     s.push_str("- When you create a new doc, also update `INDEX.md` with a single-line entry: `<label> - <relative/path.md>`.\n");
@@ -1118,8 +1951,8 @@ fn build_turn_input(
     s.push_str("- Prefer tightening rules (require_approval/deny). Only propose allow rules when the user explicitly wants to loosen restrictions.\n\n");
 
     s.push_str("File uploads:\n");
-    s.push_str("- Any files you create via `context_writes` will automatically be uploaded to this Slack thread.\n");
-    s.push_str("- You can also specify additional files to upload via `upload_files` (relative paths under the context directory).\n\n");
+    s.push_str("- Slack only: files written via `context_writes` are auto-uploaded, except files under `repos/`.\n");
+    s.push_str("- To upload specific repo files (or a patch/diff you generated), list them in `upload_files` (relative paths under the context directory).\n\n");
 
     s.push_str("Reply control:\n");
     s.push_str("- Always include `should_reply`.\n");
@@ -1697,6 +2530,16 @@ fn sanitize_rel_path(path: &str) -> anyhow::Result<std::path::PathBuf> {
         anyhow::bail!("AGENTS.md edits are not allowed via context_writes");
     }
     Ok(p)
+}
+
+fn is_under_repos_dir(path: &str) -> bool {
+    use std::path::Component;
+
+    let p = std::path::Path::new(path.trim());
+    matches!(
+        p.components().next(),
+        Some(Component::Normal(os)) if os == std::ffi::OsStr::new("repos")
+    )
 }
 
 fn clamp_len(s: String, max: usize) -> String {
