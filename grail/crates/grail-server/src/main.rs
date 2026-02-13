@@ -617,7 +617,21 @@ async fn slack_events(
                     files,
                     ..
                 } => {
-                    let ct = channel_type.as_deref().unwrap_or("");
+                    let ct = channel_type
+                        .as_deref()
+                        .filter(|v| !v.trim().is_empty())
+                        .or_else(|| {
+                            if channel.starts_with('D') {
+                                Some("im")
+                            } else if channel.starts_with('G') {
+                                Some("group")
+                            } else if channel.starts_with('C') {
+                                Some("channel")
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or("");
                     // Ignore bot messages and non-user subtypes to avoid loops.
                     if bot_id.is_some() || subtype.is_some() {
                         return (StatusCode::OK, "").into_response();
@@ -650,6 +664,11 @@ async fn slack_events(
                             files,
                         )
                     } else {
+                        warn!(
+                            channel_id = %channel,
+                            channel_type = %ct,
+                            "ignoring slack message with unknown channel type"
+                        );
                         return (StatusCode::OK, "").into_response();
                     }
                 }
